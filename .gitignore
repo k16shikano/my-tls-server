@@ -1,0 +1,14 @@
+# Keys and secrets
+*.key
+*.pem
+*.der
+
+# log file
+*.log
+
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Local dependencies (if not shared)
+rustls/

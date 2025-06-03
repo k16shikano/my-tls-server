@@ -1,0 +1,11 @@
+[package]
+name = "my-tls-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+ring = "0.17.7"
+anyhow = "1.0"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+sha2 = "0.10"
