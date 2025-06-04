@@ -57,12 +57,9 @@ pub struct KeySchedule {
     master_secret: Vec<u8>,
     client_hs_traffic: Vec<u8>,
     server_hs_traffic: Vec<u8>,
-    client_handshake_iv: [u8; 12],
-    server_handshake_iv: [u8; 12],
     cipher_suite: &'static ring::aead::Algorithm,
-    client_handshake_seq: u64,
-    server_handshake_seq: u64,
     digest_alg: &'static ring::digest::Algorithm,
+    sequence_number: u64,
 }
 
 fn aead_alg_from_suite(s: u16) -> &'static ring::aead::Algorithm {
@@ -126,7 +123,6 @@ impl KeySchedule {
         let empty_hash_digest = digest::digest(digest_alg, b"");
         let empty_hash = empty_hash_digest.as_ref();
         let derived_label = hkdf_label("derived", empty_hash, hash_len);
-        //println!("derived_label: {:02x?}", derived_label);           // HKDF-Label の構造
         let mut secret_state = vec![0u8; hash_len];
         early_secret.expand(&derived_label, hkdf_alg)
             .map_err(|e| anyhow::anyhow!("Failed to expand early secret: {}", e))?
@@ -151,8 +147,6 @@ impl KeySchedule {
             .map_err(|e| anyhow::anyhow!("Failed to expand server handshake traffic secret: {}", e))?
             .fill(&mut server_hs_traffic)
             .map_err(|e| anyhow::anyhow!("Failed to fill server handshake traffic secret: {}", e))?;
-
-        println!("server_hs_traffic: {:02x?}", server_hs_traffic);
 
         // 4. Client Handshake Traffic Secretの導出
         let client_hs_traffic_label = hkdf_label("c hs traffic", transcript_hash, hash_len);
@@ -181,16 +175,6 @@ impl KeySchedule {
             .fill(&mut master_secret)
             .map_err(|e| anyhow::anyhow!("Failed to fill master secret: {}", e))?;
 
-        // 6. Server Handshake Key/IVの導出
-        let server_handshake_key = server_hs_traffic.clone();
-        let mut server_handshake_iv = [0u8; 12];
-        server_handshake_iv.copy_from_slice(&server_hs_traffic[..12]);
-
-        // 7. Client Handshake Key/IVの導出
-        let client_handshake_key = client_hs_traffic.clone();
-        let mut client_handshake_iv = [0u8; 12];
-        client_handshake_iv.copy_from_slice(&client_hs_traffic[..12]);
-
         Ok(Self {
             early_secret,
             secret_state,
@@ -198,19 +182,20 @@ impl KeySchedule {
             master_secret,
             client_hs_traffic,
             server_hs_traffic,
-            client_handshake_iv,
-            server_handshake_iv,
             cipher_suite: aead_alg,
-            client_handshake_seq: 0,
-            server_handshake_seq: 0,
             digest_alg,
+            sequence_number: 0,
         })
     }
 
     pub fn encrypt_handshake(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        println!("\n=== Encrypting Handshake Message ===");
+        println!("Plaintext (handshake message): {:02x?}", plaintext);
+        println!("Handshake type: {:02x}", plaintext[0]);
+
         // レコードヘッダーを作成（長さフィールドは後で設定）
         let mut record = Vec::new();
-        record.push(0x16); // Handshake
+        record.push(0x17); // ApplicationData (TLS 1.3では暗号化されたレコードは全てApplicationData)
         record.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
         record.extend_from_slice(&[0x00, 0x00]); // Length placeholder
 
@@ -218,10 +203,40 @@ impl KeySchedule {
         let key_len = self.cipher_suite.key_len();
         let mut key = vec![0u8; key_len];
         key.copy_from_slice(&self.server_hs_traffic[..key_len]);
+        println!("AEAD Key: {:02x?}", key);
 
-        // 暗号化
-        let nonce = self.generate_nonce();
-        let aad = self.compute_aad(record[0], &record[1..5]);
+        // record_ivの導出（server_hs_trafficの先頭12バイト）
+        let mut record_iv = [0u8; 12];
+        record_iv.copy_from_slice(&self.server_hs_traffic[..12]);
+        println!("Record IV: {:02x?}", record_iv);
+
+        // sequence_numberを8バイトの配列に変換
+        let seq_bytes = self.sequence_number.to_be_bytes();
+        println!("Sequence number: {:02x?}", seq_bytes);
+
+        // nonce = XOR(record_iv, padded_sequence_number)
+        let mut nonce = [0u8; 12];
+        for i in 0..12 {
+            if i < 4 {
+                nonce[i] = record_iv[i];
+            } else {
+                nonce[i] = record_iv[i] ^ seq_bytes[i - 4];
+            }
+        }
+        println!("AEAD Nonce: {:02x?}", nonce);
+        
+        // TLSInnerPlaintextの構築
+        let mut inner_plaintext = Vec::new();
+        inner_plaintext.extend_from_slice(plaintext);
+        inner_plaintext.push(0x16); // Handshake type
+        println!("TLSInnerPlaintext: {:02x?}", inner_plaintext);
+
+        // 暗号文の長さを計算（TLSInnerPlaintext + 認証タグ）
+        let ciphertext_len = inner_plaintext.len() + self.cipher_suite.tag_len();
+        
+        // AADの計算（暗号文の長さを含む）
+        let aad = self.compute_aad(record[0], &record[1..5], ciphertext_len);
+        println!("AEAD AAD: {:02x?}", aad);
         
         let key = LessSafeKey::new(UnboundKey::new(self.cipher_suite, &key)
             .map_err(|e| anyhow::anyhow!("Failed to create unbound key: {}", e))?);
@@ -229,9 +244,12 @@ impl KeySchedule {
         let nonce = Nonce::try_assume_unique_for_key(&nonce)
             .map_err(|e| anyhow::anyhow!("Failed to create nonce: {}", e))?;
         
-        let mut ciphertext = plaintext.to_vec();
+        let mut ciphertext = inner_plaintext.clone();
         let tag = key.seal_in_place_separate_tag(nonce, Aad::from(&aad), &mut ciphertext)
             .map_err(|e| anyhow::anyhow!("Failed to encrypt: {}", e))?;
+        
+        println!("AEAD Ciphertext: {:02x?}", ciphertext);
+        println!("AEAD Tag: {:02x?}", tag.as_ref());
         
         // 暗号文と認証タグを結合
         ciphertext.extend_from_slice(tag.as_ref());
@@ -243,9 +261,11 @@ impl KeySchedule {
 
         // レコードに暗号文を追加
         record.extend_from_slice(&ciphertext);
+        println!("Final Record: {:02x?}", record);
+        println!("=== End of Encryption ===\n");
 
         // シーケンス番号をインクリメント
-        self.server_handshake_seq += 1;
+        self.sequence_number += 1;
 
         Ok(record)
     }
@@ -272,8 +292,8 @@ impl KeySchedule {
         let mut plaintext = encrypted_data.to_vec();
 
         // ノンスとAADの生成
-        let nonce = self.generate_nonce();
-        let aad = self.compute_aad(ciphertext[0], &ciphertext[1..5]);
+        let nonce = [0u8; 12]; // TLS 1.3では固定のnonceを使用
+        let aad = self.compute_aad(ciphertext[0], &ciphertext[1..5], ciphertext.len());
 
         // 鍵の作成
         let key = LessSafeKey::new(UnboundKey::new(self.cipher_suite, &key)
@@ -286,9 +306,6 @@ impl KeySchedule {
         key.open_in_place(nonce, Aad::from(&aad), &mut plaintext)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt: {}", e))?;
 
-        // シーケンス番号をインクリメント
-        self.client_handshake_seq += 1;
-
         Ok(plaintext)
     }
 
@@ -299,7 +316,7 @@ impl KeySchedule {
         record.extend_from_slice(&[0x00, 0x00]); // Length placeholder
 
         let nonce = self.generate_nonce();
-        let aad = self.compute_aad(record[0], &record[1..5]);
+        let aad = self.compute_aad(record[0], &record[1..5], 0);
         let ciphertext = self.encrypt_with_nonce(plaintext, &nonce, &aad).unwrap();
 
         let length = (ciphertext.len() + 16) as u16; // +16 for auth tag
@@ -318,7 +335,7 @@ impl KeySchedule {
         }
 
         let nonce = &ciphertext[5..21];
-        let aad = self.compute_aad(ciphertext[0], &ciphertext[1..5]);
+        let aad = self.compute_aad(ciphertext[0], &ciphertext[1..5], ciphertext.len());
         let plaintext = self.decrypt_with_nonce(&ciphertext[21..], nonce, &aad)?;
 
         if plaintext.is_empty() {
@@ -539,52 +556,9 @@ impl KeySchedule {
             .fill(&mut new_server_ap_traffic)
             .map_err(|e| anyhow::anyhow!("Failed to fill new server app traffic: {}", e))?;
 
-        // 新しい鍵とIVの導出
-        let key_len = self.cipher_suite.key_len();
-        let mut new_client_application_key = vec![0u8; key_len];
-        let client_ap_key_label = hkdf_label("key", &[], key_len);
-        let client_ap_traffic_prk = salt.extract(&new_client_ap_traffic);
-        client_ap_traffic_prk.expand(&client_ap_key_label[..], self.cipher_suite)
-            .map_err(|e| anyhow::anyhow!("Failed to expand new client application key: {}", e))?
-            .fill(&mut new_client_application_key)
-            .map_err(|e| anyhow::anyhow!("Failed to fill new client application key: {}", e))?;
-
-        let mut new_server_application_key = vec![0u8; key_len];
-        let server_ap_key_label = hkdf_label("key", b"", key_len);
-        let server_ap_traffic_prk = salt.extract(&new_server_ap_traffic);
-        server_ap_traffic_prk.expand(&server_ap_key_label[..], self.cipher_suite)
-            .map_err(|e| anyhow::anyhow!("Failed to expand new server application key: {}", e))?
-            .fill(&mut new_server_application_key)
-            .map_err(|e| anyhow::anyhow!("Failed to fill new server application key: {}", e))?;
-
-        // 新しいIVの導出
-        let mut tmp = vec![0u8; hkdf_alg.len()];
-        let client_ap_iv_label = hkdf_label("iv", b"", 12);
-        client_ap_traffic_prk.expand(&client_ap_iv_label[..], hkdf_alg)
-            .map_err(|e| anyhow::anyhow!("Failed to expand new client application iv: {}", e))?
-            .fill(&mut tmp)
-            .map_err(|e| anyhow::anyhow!("Failed to fill new client application iv: {}", e))?;
-        let mut new_client_application_iv = [0u8; 12];
-        new_client_application_iv.copy_from_slice(&tmp[..12]);
-
-        let mut tmp = vec![0u8; hkdf_alg.len()];
-        let server_ap_iv_label = hkdf_label("iv", b"", 12);
-        server_ap_traffic_prk.expand(&server_ap_iv_label[..], hkdf_alg)
-            .map_err(|e| anyhow::anyhow!("Failed to expand new server application iv: {}", e))?
-            .fill(&mut tmp)
-            .map_err(|e| anyhow::anyhow!("Failed to fill new server application iv: {}", e))?;
-        let mut new_server_application_iv = [0u8; 12];
-        new_server_application_iv.copy_from_slice(&tmp[..12]);
-
-        // 鍵とIVの更新
+        // 鍵の更新
         self.client_hs_traffic = new_client_ap_traffic;
         self.server_hs_traffic = new_server_ap_traffic;
-        self.client_handshake_iv = new_client_application_iv;
-        self.server_handshake_iv = new_server_application_iv;
-
-        // アプリケーション鍵更新時にシーケンス番号をリセット
-        self.client_handshake_seq = 0;
-        self.server_handshake_seq = 0;
 
         Ok(())
     }
@@ -615,54 +589,9 @@ impl KeySchedule {
             .fill(&mut server_ap_traffic)
             .map_err(|e| anyhow::anyhow!("Failed to fill server app traffic: {}", e))?;
 
-        // Application Key and IV derivation
-        let salt_for_app1 = Salt::new(hkdf_alg, &[]);
-        let client_ap_traffic_prk = salt_for_app1.extract(&client_ap_traffic);
-        let salt_for_app2 = Salt::new(hkdf_alg, &[]);
-        let server_ap_traffic_prk = salt_for_app2.extract(&server_ap_traffic);
-
-        // Client Application Keyの導出
-        let key_len = self.cipher_suite.key_len();
-        let mut client_application_key = vec![0u8; key_len];
-        let client_ap_key_label = hkdf_label("key", b"", key_len);
-        client_ap_traffic_prk.expand(&client_ap_key_label[..], self.cipher_suite)
-            .map_err(|e| anyhow::anyhow!("Failed to expand client application key: {}", e))?
-            .fill(&mut client_application_key)
-            .map_err(|e| anyhow::anyhow!("Failed to fill client application key: {}", e))?;
-
-        // Server Application Keyの導出
-        let mut server_application_key = vec![0u8; key_len];
-        let server_ap_key_label = hkdf_label("key", b"", key_len);
-        server_ap_traffic_prk.expand(&server_ap_key_label[..], self.cipher_suite)
-            .map_err(|e| anyhow::anyhow!("Failed to expand server application key: {}", e))?
-            .fill(&mut server_application_key)
-            .map_err(|e| anyhow::anyhow!("Failed to fill server application key: {}", e))?;
-
-        // Client Application IVの導出
-        let mut tmp = vec![0u8; hash_len];
-        let client_ap_iv_label = hkdf_label("iv", b"", 12);
-        client_ap_traffic_prk.expand(&client_ap_iv_label[..], hkdf_alg)
-            .map_err(|e| anyhow::anyhow!("Failed to expand client application iv: {}", e))?
-            .fill(&mut tmp)
-            .map_err(|e| anyhow::anyhow!("Failed to fill client application iv: {}", e))?;
-        let mut client_application_iv = [0u8; 12];
-        client_application_iv.copy_from_slice(&tmp[..12]);
-
-        // Server Application IVの導出
-        let mut tmp = vec![0u8; hash_len];
-        let server_ap_iv_label = hkdf_label("iv", b"", 12);
-        server_ap_traffic_prk.expand(&server_ap_iv_label[..], hkdf_alg)
-            .map_err(|e| anyhow::anyhow!("Failed to expand server application iv: {}", e))?
-            .fill(&mut tmp)
-            .map_err(|e| anyhow::anyhow!("Failed to fill server application iv: {}", e))?;
-        let mut server_application_iv = [0u8; 12];
-        server_application_iv.copy_from_slice(&tmp[..12]);
-
-        // 鍵とIVの更新
-        self.client_hs_traffic = client_application_key;
-        self.server_hs_traffic = server_application_key;
-        self.client_handshake_iv = client_application_iv;
-        self.server_handshake_iv = server_application_iv;
+        // 鍵の更新
+        self.client_hs_traffic = client_ap_traffic;
+        self.server_hs_traffic = server_ap_traffic;
 
         Ok(())
     }
@@ -695,21 +624,17 @@ impl KeySchedule {
 
     fn generate_nonce(&self) -> [u8; 12] {
         let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&self.server_handshake_iv);
-        let seq_bytes = self.server_handshake_seq.to_be_bytes();
-        
-        // 後ろ8バイトとシーケンス番号をXOR
-        for i in 0..8 {
-            nonce[4 + i] ^= seq_bytes[i];
-        }
-        
+        nonce.copy_from_slice(&self.server_hs_traffic[..12]);
         nonce
     }
 
-    fn compute_aad(&self, content_type: u8, header: &[u8]) -> Vec<u8> {
+    fn compute_aad(&self, content_type: u8, header: &[u8], ciphertext_len: usize) -> Vec<u8> {
         let mut aad = Vec::new();
-        aad.push(content_type);
-        aad.extend_from_slice(header);
+        aad.push(content_type);  // レコードタイプ（1バイト）
+        aad.extend_from_slice(&header[..2]);  // プロトコルバージョン（2バイト）
+        // 暗号文の長さ（2バイト、ビッグエンディアン）
+        aad.push((ciphertext_len >> 8) as u8);
+        aad.push(ciphertext_len as u8);
         aad
     }
 
