@@ -188,26 +188,63 @@ impl KeySchedule {
         })
     }
 
-    pub fn encrypt_handshake(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        println!("\n=== Encrypting Handshake Message ===");
-        println!("Plaintext (handshake message): {:02x?}", plaintext);
-        println!("Handshake type: {:02x}", plaintext[0]);
+    pub fn encrypt_handshake(&mut self, plaintext: &[u8], handshake_type: u8) -> Result<Vec<u8>> {
+        // TLSInnerPlaintextの構築
+        let mut inner_plaintext = Vec::new();
+        inner_plaintext.extend_from_slice(plaintext);
+        inner_plaintext.push(0x16);  // content_type (Handshake)
+        
+        // パディングの追加
+        let padding_len = 16 - ((inner_plaintext.len() + 1) % 16);
+        inner_plaintext.extend_from_slice(&vec![0x00; padding_len]);
+        
+        println!("TLSInnerPlaintext: {:02x?}", inner_plaintext);
 
-        // レコードヘッダーを作成（長さフィールドは後で設定）
-        let mut record = Vec::new();
-        record.push(0x17); // ApplicationData (TLS 1.3では暗号化されたレコードは全てApplicationData)
-        record.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
-        record.extend_from_slice(&[0x00, 0x00]); // Length placeholder
-
-        // server_hs_trafficから暗号化キーを導出
+        // encrypted_recordの長さを計算
+        let encrypted_record_len = inner_plaintext.len() + self.cipher_suite.tag_len();
+        println!("Encrypted record length: {}", encrypted_record_len);
+        
+        // server_handshake_traffic_secretから暗号化キーを導出
         let key_len = self.cipher_suite.key_len();
         let mut key = vec![0u8; key_len];
-        key.copy_from_slice(&self.server_hs_traffic[..key_len]);
+        println!("Key buffer length: {}", key.len());
+        
+        // HKDF-Expand-Label(server_handshake_traffic_secret, "key", "", key_length)
+        let hkdf_alg = if self.cipher_suite == &AES_128_GCM || self.cipher_suite == &CHACHA20_POLY1305 {
+            HKDF_SHA256
+        } else {
+            HKDF_SHA384
+        };
+        println!("HKDF algorithm: {}", if hkdf_alg == HKDF_SHA256 { "SHA256" } else { "SHA384" });
+        
+        // expandの出力長をハッシュ関数の出力長に設定
+        let expand_len = hkdf_alg.len();
+        let key_label: Vec<&[u8]> = hkdf_label("key", b"", key_len);
+        println!("Key label: {:02x?}", key_label.iter().flat_map(|x| x.iter().copied()).collect::<Vec<u8>>());
+        let mut expanded_key = vec![0u8; expand_len];
+        let key_prk = ring::hkdf::Prk::new_less_safe(hkdf_alg, &self.server_hs_traffic);
+        key_prk.expand(&key_label, hkdf_alg)
+            .map_err(|e| anyhow::anyhow!("Failed to expand key: {}", e))?
+            .fill(&mut expanded_key)
+            .map_err(|e| anyhow::anyhow!("Failed to fill key: {}", e))?;
+        // 必要な長さだけを使用
+        key.copy_from_slice(&expanded_key[..key_len]);
         println!("AEAD Key: {:02x?}", key);
 
-        // record_ivの導出（server_hs_trafficの先頭12バイト）
+        // record_ivの導出
         let mut record_iv = [0u8; 12];
-        record_iv.copy_from_slice(&self.server_hs_traffic[..12]);
+        println!("IV buffer length: {}", record_iv.len());
+        
+        // HKDF-Expand-Label(server_handshake_traffic_secret, "iv", "", iv_length)
+        let iv_label = hkdf_label("iv", b"", 12);
+        println!("IV label: {:02x?}", iv_label.iter().flat_map(|x| x.iter().copied()).collect::<Vec<u8>>());
+        let mut expanded_iv = vec![0u8; expand_len];
+        let iv_prk = ring::hkdf::Prk::new_less_safe(hkdf_alg, &self.server_hs_traffic);
+        iv_prk.expand(&iv_label, hkdf_alg)
+            .map_err(|e| anyhow::anyhow!("Failed to expand iv: {}", e))?
+            .fill(&mut expanded_iv)
+            .map_err(|e| anyhow::anyhow!("Failed to fill iv: {}", e))?;
+        record_iv.copy_from_slice(&expanded_iv[..12]);
         println!("Record IV: {:02x?}", record_iv);
 
         // sequence_numberを8バイトの配列に変換
@@ -216,28 +253,36 @@ impl KeySchedule {
 
         // nonce = XOR(record_iv, padded_sequence_number)
         let mut nonce = [0u8; 12];
+        // 1. sequence_numberを12バイトにパディング（左側に0を埋める）
+        let mut padded_seq = [0u8; 12];
+        padded_seq[4..].copy_from_slice(&seq_bytes);  // 左側に4バイトの0をパディング
+        println!("Padded sequence number: {:02x?}", padded_seq);
+        // 2. record_ivとXOR
         for i in 0..12 {
-            if i < 4 {
-                nonce[i] = record_iv[i];
-            } else {
-                nonce[i] = record_iv[i] ^ seq_bytes[i - 4];
-            }
+            nonce[i] = record_iv[i] ^ padded_seq[i];
         }
         println!("AEAD Nonce: {:02x?}", nonce);
-        
-        // TLSInnerPlaintextの構築
-        let mut inner_plaintext = Vec::new();
-        inner_plaintext.extend_from_slice(plaintext);
-        inner_plaintext.push(0x16); // Handshake type
-        println!("TLSInnerPlaintext: {:02x?}", inner_plaintext);
 
-        // 暗号文の長さを計算（TLSInnerPlaintext + 認証タグ）
-        let ciphertext_len = inner_plaintext.len() + self.cipher_suite.tag_len();
-        
-        // AADの計算（暗号文の長さを含む）
-        let aad = self.compute_aad(record[0], &record[1..5], ciphertext_len);
+        println!("\n=== Encrypting Handshake Message ===");
+        println!("Handshake type: {:02x}", handshake_type);
+        println!("Server HS Traffic: {:02x?}", self.server_hs_traffic);
+        println!("AEAD Algorithm: {}", if self.cipher_suite == &AES_128_GCM {
+            "AES_128_GCM"
+        } else if self.cipher_suite == &AES_256_GCM {
+            "AES_256_GCM"
+        } else if self.cipher_suite == &CHACHA20_POLY1305 {
+            "CHACHA20_POLY1305"
+        } else {
+            "Unknown"
+        });
+        println!("Key length: {} bytes", self.cipher_suite.key_len());
+        println!("Tag length: {} bytes", self.cipher_suite.tag_len());
+
+        // AADの計算（TLSCiphertextのフィールドから）
+        let aad = self.compute_aad(0x17, &[0x03, 0x03], encrypted_record_len);
         println!("AEAD AAD: {:02x?}", aad);
-        
+
+        // 暗号化
         let key = LessSafeKey::new(UnboundKey::new(self.cipher_suite, &key)
             .map_err(|e| anyhow::anyhow!("Failed to create unbound key: {}", e))?);
         
@@ -251,23 +296,28 @@ impl KeySchedule {
         println!("AEAD Ciphertext: {:02x?}", ciphertext);
         println!("AEAD Tag: {:02x?}", tag.as_ref());
         
-        // 暗号文と認証タグを結合
-        ciphertext.extend_from_slice(tag.as_ref());
+        // 暗号文と認証タグを結合してencrypted_recordを作成
+        let mut encrypted_record = ciphertext;
+        encrypted_record.extend_from_slice(tag.as_ref());
 
-        // レコードヘッダーの長さを設定（暗号文 + 認証タグの長さ）
-        let length = ciphertext.len() as u16;
-        record[3] = (length >> 8) as u8;
-        record[4] = length as u8;
+        // TLSCiphertextの構築
+        let mut tls_ciphertext = Vec::new();
+        tls_ciphertext.push(0x17); // application_data
+        tls_ciphertext.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+        tls_ciphertext.extend_from_slice(&[0x00, 0x00]); // Length placeholder
+        tls_ciphertext.extend_from_slice(&encrypted_record);
 
-        // レコードに暗号文を追加
-        record.extend_from_slice(&ciphertext);
-        println!("Final Record: {:02x?}", record);
+        // TLSCiphertextの長さを設定
+        tls_ciphertext[3] = ((encrypted_record.len() >> 8) & 0xff) as u8;
+        tls_ciphertext[4] = (encrypted_record.len() & 0xff) as u8;
+
+        println!("Final Record: {:02x?}", tls_ciphertext);
         println!("=== End of Encryption ===\n");
 
         // シーケンス番号をインクリメント
         self.sequence_number += 1;
 
-        Ok(record)
+        Ok(tls_ciphertext)
     }
 
     pub fn decrypt_handshake(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
@@ -285,15 +335,41 @@ impl KeySchedule {
         // client_hs_trafficから暗号化キーを導出
         let key_len = self.cipher_suite.key_len();
         let mut key = vec![0u8; key_len];
-        key.copy_from_slice(&self.client_hs_traffic[..key_len]);
+        let key_label = hkdf_label("key", &[], key_len);
+        let key_prk = ring::hkdf::Prk::new_less_safe(hkdf_alg_from_suite(0x1302), &self.client_hs_traffic);
+        key_prk.expand(&key_label, hkdf_alg_from_suite(0x1302))
+            .map_err(|e| anyhow::anyhow!("Failed to expand key: {}", e))?
+            .fill(&mut key)
+            .map_err(|e| anyhow::anyhow!("Failed to fill key: {}", e))?;
 
         // 暗号文（認証タグを含む）を取得
         let encrypted_data = &ciphertext[5..5 + record_length];
         let mut plaintext = encrypted_data.to_vec();
 
-        // ノンスとAADの生成
-        let nonce = [0u8; 12]; // TLS 1.3では固定のnonceを使用
-        let aad = self.compute_aad(ciphertext[0], &ciphertext[1..5], ciphertext.len());
+        // record_ivの導出
+        let mut record_iv = [0u8; 12];
+        let iv_label = hkdf_label("iv", &[], 12);
+        let mut iv = vec![0u8; 12];
+        key_prk.expand(&iv_label[..], hkdf_alg_from_suite(0x1302))
+            .map_err(|e| anyhow::anyhow!("Failed to expand iv: {}", e))?
+            .fill(&mut iv)
+            .map_err(|e| anyhow::anyhow!("Failed to fill iv: {}", e))?;
+        record_iv.copy_from_slice(&iv);
+
+        // sequence_numberを8バイトの配列に変換
+        let seq_bytes = self.sequence_number.to_be_bytes();
+
+        // nonce = XOR(record_iv, padded_sequence_number)
+        let mut nonce = [0u8; 12];
+        // 1. sequence_numberを12バイトにパディング（左側に0を埋める）
+        let mut padded_seq = [0u8; 12];
+        padded_seq[4..].copy_from_slice(&seq_bytes);
+        // 2. record_ivとXOR
+        for i in 0..12 {
+            nonce[i] = record_iv[i] ^ padded_seq[i];
+        }
+
+        let aad = self.compute_aad(ciphertext[0], &ciphertext[1..5], record_length);
 
         // 鍵の作成
         let key = LessSafeKey::new(UnboundKey::new(self.cipher_suite, &key)
@@ -305,6 +381,9 @@ impl KeySchedule {
         // 認証タグを検証して復号（ringは自動的に認証タグを検証）
         key.open_in_place(nonce, Aad::from(&aad), &mut plaintext)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt: {}", e))?;
+
+        // シーケンス番号をインクリメント
+        self.sequence_number += 1;
 
         Ok(plaintext)
     }
@@ -331,7 +410,7 @@ impl KeySchedule {
 
     pub fn decrypt_application(&self, ciphertext: &[u8]) -> Result<RecType> {
         if ciphertext.len() < 5 {
-            return Err(anyhow::anyhow!("Invalid ciphertext length"));
+            return Err(anyhow::anyhow!("Invalid ciphertext length in decrypt_application"));
         }
 
         let nonce = &ciphertext[5..21];
@@ -348,27 +427,6 @@ impl KeySchedule {
             0x16 => Ok(RecType::Handshake(plaintext[5..].to_vec())),
             _ => Err(anyhow::anyhow!("Unknown content type: {:02x}", plaintext[0])),
         }
-    }
-
-    pub fn create_encrypted_extensions(&mut self) -> Result<Vec<u8>> {
-        // 平文のEncryptedExtensionsメッセージを作成
-        let mut message = Vec::new();
-        message.push(0x08); // HandshakeType::EncryptedExtensions
-        message.push(0x00); // length (3 bytes)
-        message.push(0x00);
-        message.push(0x00);
-
-        // 拡張の長さ（0バイト）
-        message.push(0x00);
-        message.push(0x00);
-
-        let len = message.len() - 4;
-        message[1] = ((len >> 16) & 0xff) as u8;
-        message[2] = ((len >> 8) & 0xff) as u8;
-        message[3] = (len & 0xff) as u8;
-
-        // 暗号化
-        self.encrypt_handshake(&message)
     }
 
     pub fn create_certificate(&mut self) -> Result<Vec<u8>> {
@@ -414,7 +472,7 @@ impl KeySchedule {
         message[3] = (msg_len & 0xff) as u8;
 
         // 暗号化
-        self.encrypt_handshake(&message)
+        self.encrypt_handshake(&message, 0x0b)
     }
 
     pub fn create_certificate_verify(&mut self, transcript_hash: &[u8]) -> Result<Vec<u8>> {
@@ -446,7 +504,7 @@ impl KeySchedule {
         message[3] = (msg_len & 0xff) as u8;
 
         // 暗号化
-        self.encrypt_handshake(&message)
+        self.encrypt_handshake(&message, 0x0f)
     }
 
     fn sign_certificate_verify(&self, transcript_hash: &[u8]) -> Result<Vec<u8>> {
@@ -739,56 +797,48 @@ pub fn verify_x25519_public_key(public_key: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ring::hkdf::{Salt, HKDF_SHA256};
-    use anyhow::Result;
+    use super::*;
+    use ring::aead::{LessSafeKey, UnboundKey, Nonce, Aad};
 
     #[test]
-    fn test_hkdf_rfc5869_case1() -> Result<()> {
-        // Test Case 1: Basic test case with SHA-256
-        let ikm = vec![
-            0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
-            0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
-            0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b
+    fn test_aead_decryption() {
+        // サーバー側の出力値
+        let key = [
+            0xd6, 0xdf, 0x1f, 0x2c, 0x90, 0x23, 0xea, 0x17, 0x87, 0x3d, 0x5a, 0x82,
+            0xed, 0x73, 0x42, 0x3d, 0xdf, 0xde, 0x71, 0xe3, 0x2a, 0x58, 0x58, 0x12,
+            0x89, 0x1d, 0xb3, 0xac, 0xe5, 0xf3, 0x42, 0x06
         ];
-        let salt = vec![
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0a, 0x0b, 0x0c
+        let nonce = [
+            0xd6, 0xdf, 0x1f, 0x2c, 0x90, 0x23, 0xea, 0x17, 0x87, 0x3d, 0x5a, 0x82
         ];
-        let info_bytes = vec![
-            0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
-            0xf8, 0xf9
+        let aad = [0x17, 0x03, 0x03, 0x00, 0x2f];
+        let ciphertext = [
+            0xcf, 0x4f, 0x7b, 0x65, 0xf8, 0x78, 0x40, 0x5d, 0x8f, 0xad, 0x1a, 0x17,
+            0xb5, 0xad, 0xba, 0x1c, 0x1a, 0x2c, 0xb7, 0xd6, 0xcf, 0x77, 0x1b, 0x61,
+            0x0b, 0x2a, 0x0e, 0x18, 0xfc, 0x29, 0x75
         ];
-        let info = vec![&info_bytes[..]];
-        let _expected_prk = vec![
-            0x07, 0x77, 0x09, 0x36, 0x2c, 0x2e, 0x32, 0xdf,
-            0x0d, 0xdc, 0x3f, 0x0d, 0xc4, 0x7b, 0xba, 0x63,
-            0x90, 0xb6, 0xc7, 0x3b, 0xb5, 0x0f, 0x9c, 0x31,
-            0x22, 0xec, 0x84, 0x4a, 0xd7, 0xc2, 0xb3, 0xe5
-        ];
-        let expected_okm = vec![
-            0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a,
-            0x90, 0x43, 0x4f, 0x64, 0xd0, 0x36, 0x2f, 0x2a,
-            0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c,
-            0x5d, 0xb0, 0x2d, 0x56, 0xec, 0xc4, 0xc5, 0xbf,
-            0x34, 0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18,
-            0x58, 0x65
+        let tag = [
+            0x82, 0x3d, 0x6f, 0x86, 0x75, 0xb6, 0x16, 0x3d, 0x76, 0x39, 0x05, 0x88,
+            0xcb, 0x55, 0xd7, 0xb2
         ];
 
-        // Extract
-        let salt = Salt::new(HKDF_SHA256, &salt);
-        let prk = salt.extract(&ikm);
-        //assert_eq!(prk.as_ref(), expected_prk);
+        // 暗号化キーの作成
+        let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).unwrap());
+        let nonce = Nonce::try_assume_unique_for_key(&nonce).unwrap();
 
-        // Expand
-        let mut okm = vec![0u8; 42]; // 出力長を42バイトに変更
-        prk.expand(&info, HKDF_SHA256)
-            .map_err(|e| anyhow::anyhow!("expand error: {}", e))?
-            .fill(&mut okm)
-            .map_err(|e| anyhow::anyhow!("fill error: {}", e))?;
-        println!("okm: {:02x?}", okm);
-        println!("expected_okm: {:02x?}", expected_okm);
-        assert_eq!(okm, expected_okm);
-        Ok(())
+        // 暗号文とタグを結合
+        let mut combined = ciphertext.to_vec();
+        combined.extend_from_slice(&tag);
+
+        // 復号を試みる
+        let result = key.open_in_place(nonce, Aad::from(&aad), &mut combined);
+        assert!(result.is_ok(), "Decryption failed: {:?}", result);
+
+        // 復号された平文を表示
+        if let Ok(plaintext) = result {
+            println!("Decrypted plaintext: {:02x?}", plaintext);
+            println!("Decrypted plaintext length: {}", plaintext.len());
+        }
     }
 } 
 

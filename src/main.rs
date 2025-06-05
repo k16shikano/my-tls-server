@@ -2,6 +2,7 @@ mod record;
 mod handshake;
 mod crypto;
 mod server_hello;
+mod encrypted_extensions;
 
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,6 +47,21 @@ async fn main() -> Result<()> {
     // ClientHelloの解析
     let client_hello = handshake::ClientHello::from_bytes(&record.fragment)
         .ok_or_else(|| anyhow::anyhow!("Invalid ClientHello"))?;
+
+    println!("\n=== ClientHello Extensions ===");
+    for ext in &client_hello.extensions {
+        match ext.extension_type {
+            0x002b => println!("supported_versions: {:02x?}", ext.extension_data),
+            0x000a => println!("supported_groups: {:02x?}", ext.extension_data),
+            0x000d => println!("signature_algorithms: {:02x?}", ext.extension_data),
+            0x0033 => println!("key_share: {:02x?}", ext.extension_data),
+            0x0029 => println!("pre_shared_key: {:02x?}", ext.extension_data),
+            0x002a => println!("early_data: {:02x?}", ext.extension_data),
+            0x0031 => println!("post_handshake_auth: {:02x?}", ext.extension_data),
+            _ => println!("Other extension (0x{:04x}): {:02x?}", ext.extension_type, ext.extension_data),
+        }
+    }
+    println!("=============================\n");
 
     // 鍵交換の準備
     let rng = SystemRandom::new();
@@ -204,9 +220,44 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to initialize key schedule: {}", e))?;
 
     // EncryptedExtensions
-    let encrypted_extensions = key_schedule.create_encrypted_extensions()?;
-    socket.write_all(&encrypted_extensions).await?;
-    println!("SENT: EncryptedExtensions: {:02x?}", encrypted_extensions);
+    let mut encrypted_extensions = encrypted_extensions::EncryptedExtensions::new();
+    
+    // supported_versions拡張は送信しない
+    // let mut supported_versions = Vec::new();
+    // supported_versions.push(0x03); // TLS 1.3
+    // supported_versions.push(0x04);
+    // encrypted_extensions.add_extension(0x002b, supported_versions);
+    
+    // クライアントの拡張に基づいて応答を生成
+    for ext in &client_hello.extensions {
+        match ext.extension_type {
+            0x0029 => { // pre_shared_key
+                // クライアントがpre_shared_keyを要求した場合、応答に含める
+                encrypted_extensions.add_extension(0x0029, vec![]);
+            },
+            0x002a => { // early_data
+                // クライアントがearly_dataを要求した場合、応答に含める
+                encrypted_extensions.add_extension(0x002a, vec![]);
+            },
+            0x0031 => { // post_handshake_auth
+                // クライアントがpost_handshake_authを要求した場合、応答に含める
+                encrypted_extensions.add_extension(0x0031, vec![]);
+            },
+            _ => {
+                // その他の拡張は無視
+                println!("Ignoring unsupported extension: 0x{:04x}", ext.extension_type);
+            }
+        }
+    }
+    
+    // 応答する拡張の一覧を表示
+    encrypted_extensions.print_extensions();
+    
+    let encrypted_extensions_bytes = encrypted_extensions.to_bytes();
+    println!("EncryptedExtensions bytes: {:02x?}", encrypted_extensions_bytes);
+    let encrypted_extensions_record = key_schedule.encrypt_handshake(&encrypted_extensions_bytes, 0x08)?;
+    socket.write_all(&encrypted_extensions_record).await?;
+    println!("SENT: EncryptedExtensions: {:02x?}", encrypted_extensions_record);
 
     // Certificate
     let certificate = key_schedule.create_certificate()?;
@@ -220,7 +271,7 @@ async fn main() -> Result<()> {
 
     // Finished
     let finished = key_schedule.create_finished(transcript_hash.as_ref());
-    let encrypted_finished = key_schedule.encrypt_handshake(&finished)?;
+    let encrypted_finished = key_schedule.encrypt_handshake(&finished, 0x14)?;
     socket.write_all(&encrypted_finished).await?;
     println!("SENT: Finished: {:02x?}", encrypted_finished);
 
