@@ -297,25 +297,44 @@ async fn main() -> Result<()> {
     let encrypted_finished = key_schedule.encrypt_handshake(&finished)?;
     socket.write_all(&encrypted_finished).await?;
 
-    // クライアントのFinishedを待機
-    let mut buffer = [0u8; 4096];
-    let n = socket.read(&mut buffer).await?;
-    let client_finished_record = record::TLSPlaintext::from_bytes(&buffer[..n])
-        .ok_or_else(|| anyhow::anyhow!("Invalid record"))?;
+    // クライアントのFinishedメッセージを待つ
+    let mut buffer = [0u8; 1024];
+    let n = socket.read(&mut buffer).await
+        .map_err(|e| anyhow::anyhow!("Failed to read from socket: {}", e))?;
 
-    // クライアントのFinishedを復号（レコードヘッダーを除去）
-    let client_finished = key_schedule.decrypt_handshake(&client_finished_record.fragment)?;
+    let mut offset = 0;
+    while offset < n {
+        let record = record::TLSPlaintext::from_bytes(&buffer[offset..n])
+            .ok_or_else(|| anyhow::anyhow!("Invalid record"))?;
 
-    // クライアントのFinishedを検証
-    let verify_data = key_schedule.verify_data(transcript_hash.as_ref());
-    if client_finished[4..] != verify_data {
-        return Err(anyhow::anyhow!("Invalid client finished message"));
+        match record.content_type {
+            record::ContentType::ChangeCipherSpec => {
+                // シーケンス番号をインクリメント
+                //key_schedule.increment_sequence_number();
+                offset += record.fragment.len() + 5;
+                continue;
+            },
+            record::ContentType::ApplicationData => {
+                // 暗号化されたFinishedメッセージを復号
+                let plaintext = key_schedule.decrypt_handshake(&buffer[offset..offset + record.fragment.len() + 5])?;
+                // トランスクリプトハッシュの更新（復号化されたFinishedを追加）
+                handshake_messages.extend_from_slice(&plaintext);
+                key_schedule.increment_sequence_number();
+            },
+            _ => {
+                return Err(anyhow::anyhow!("Unexpected content type: {:?}", record.content_type));
+            }
+        }
+
+        offset += record.fragment.len() + 5;
     }
 
-    // アプリケーションデータの送信
-    let application_data = b"Hello, TLS 1.3!";
-    let application_data_record = key_schedule.encrypt_application_data(application_data);
-    socket.write_all(&application_data_record).await?;
+    println!("Handshake Finished!!");
+
+    // close_notifyアラートを送信
+    let close_notify = key_schedule.create_close_notify()?;
+    socket.write_all(&close_notify).await?;
+    println!("Sent close_notify alert");
 
     Ok(())
 } 

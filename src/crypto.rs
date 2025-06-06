@@ -60,7 +60,8 @@ pub struct KeySchedule {
     cipher_suite: &'static ring::aead::Algorithm,
     digest_alg: &'static ring::digest::Algorithm,
     signature_alg: u16,  // 署名アルゴリズム（例：0x0403 for ecdsa_secp256r1_sha256）
-    sequence_number: u64,
+    sent_sequence_number: u64,
+    receive_sequence_number: u64,
 }
 
 fn aead_alg_from_suite(s: u16) -> &'static ring::aead::Algorithm {
@@ -186,7 +187,8 @@ impl KeySchedule {
             cipher_suite: aead_alg,
             digest_alg,
             signature_alg,
-            sequence_number: 0,
+            sent_sequence_number: 0,
+            receive_sequence_number: 0,
         })
     }
 
@@ -240,7 +242,7 @@ impl KeySchedule {
         record_iv.copy_from_slice(&expanded_iv[..12]);
 
         // sequence_numberを8バイトの配列に変換
-        let seq_bytes = self.sequence_number.to_be_bytes();
+        let seq_bytes = self.sent_sequence_number.to_be_bytes();
 
         // nonce = XOR(record_iv, padded_sequence_number)
         let mut nonce = [0u8; 12];
@@ -282,7 +284,7 @@ impl KeySchedule {
         tls_ciphertext[4] = (encrypted_record.len() & 0xff) as u8;
 
         // シーケンス番号をインクリメント
-        self.sequence_number += 1;
+        self.sent_sequence_number += 1;
 
         Ok(tls_ciphertext)
     }
@@ -293,49 +295,61 @@ impl KeySchedule {
             return Err(anyhow::anyhow!("Invalid ciphertext length: too short {}", ciphertext.len()));
         }
 
-        // レコード長の取得
         let record_length = ((ciphertext[3] as usize) << 8) | (ciphertext[4] as usize);
-        if ciphertext.len() < 5 + record_length {
-            return Err(anyhow::anyhow!("Invalid ciphertext length: record length mismatch"));
+        let encrypted_data = &ciphertext[5..];
+        let tag_len = self.cipher_suite.tag_len();
+        if encrypted_data.len() < tag_len {
+            return Err(anyhow::anyhow!("Encrypted data too short for tag: {} < {}", encrypted_data.len(), tag_len));
         }
+
+        let mut plaintext = encrypted_data.to_vec();
 
         // client_hs_trafficから暗号化キーを導出
         let key_len = self.cipher_suite.key_len();
+        
         let mut key = vec![0u8; key_len];
-        let key_label = hkdf_label("key", &[], key_len);
-        let key_prk = ring::hkdf::Prk::new_less_safe(hkdf_alg_from_suite(0x1302), &self.client_hs_traffic);
-        key_prk.expand(&key_label, hkdf_alg_from_suite(0x1302))
+        let key_label = hkdf_label("key", b"", key_len);
+        let hkdf_alg = if self.cipher_suite == &AES_128_GCM || self.cipher_suite == &CHACHA20_POLY1305 {
+            HKDF_SHA256
+        } else {
+            HKDF_SHA384
+        };
+        
+        // expandの出力長をハッシュ関数の出力長に設定
+        let expand_len = hkdf_alg.len();
+        let mut expanded_key = vec![0u8; expand_len];
+        let key_prk = ring::hkdf::Prk::new_less_safe(hkdf_alg, &self.client_hs_traffic);
+        key_prk.expand(&key_label, hkdf_alg)
             .map_err(|e| anyhow::anyhow!("Failed to expand key: {}", e))?
-            .fill(&mut key)
+            .fill(&mut expanded_key)
             .map_err(|e| anyhow::anyhow!("Failed to fill key: {}", e))?;
-
-        // 暗号文（認証タグを含む）を取得
-        let encrypted_data = &ciphertext[5..5 + record_length];
-        let mut plaintext = encrypted_data.to_vec();
+        key.copy_from_slice(&expanded_key[..key_len]);
 
         // record_ivの導出
         let mut record_iv = [0u8; 12];
-        let iv_label = hkdf_label("iv", &[], 12);
-        let mut iv = vec![0u8; 12];
-        key_prk.expand(&iv_label[..], hkdf_alg_from_suite(0x1302))
+        
+        // HKDF-Expand-Label(client_handshake_traffic_secret, "iv", "", iv_length)
+        let iv_label = hkdf_label("iv", b"", 12);
+        let mut expanded_iv = vec![0u8; expand_len];
+        let iv_prk = ring::hkdf::Prk::new_less_safe(hkdf_alg, &self.client_hs_traffic);
+        iv_prk.expand(&iv_label, hkdf_alg)
             .map_err(|e| anyhow::anyhow!("Failed to expand iv: {}", e))?
-            .fill(&mut iv)
+            .fill(&mut expanded_iv)
             .map_err(|e| anyhow::anyhow!("Failed to fill iv: {}", e))?;
-        record_iv.copy_from_slice(&iv);
+        record_iv.copy_from_slice(&expanded_iv[..12]);
 
         // sequence_numberを8バイトの配列に変換
-        let seq_bytes = self.sequence_number.to_be_bytes();
+        let seq_bytes = self.receive_sequence_number.to_be_bytes();
 
         // nonce = XOR(record_iv, padded_sequence_number)
         let mut nonce = [0u8; 12];
-        // 1. sequence_numberを12バイトにパディング（左側に0を埋める）
         let mut padded_seq = [0u8; 12];
         padded_seq[4..].copy_from_slice(&seq_bytes);
-        // 2. record_ivとXOR
         for i in 0..12 {
             nonce[i] = record_iv[i] ^ padded_seq[i];
         }
 
+        // AADの計算（レコードヘッダーのみ）
         let aad = self.compute_aad(ciphertext[0], &ciphertext[1..5], record_length);
 
         // 鍵の作成
@@ -345,14 +359,15 @@ impl KeySchedule {
         let nonce = Nonce::try_assume_unique_for_key(&nonce)
             .map_err(|e| anyhow::anyhow!("Failed to create nonce: {}", e))?;
 
-        // 認証タグを検証して復号（ringは自動的に認証タグを検証）
-        key.open_in_place(nonce, Aad::from(&aad), &mut plaintext)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt: {}", e))?;
-
-        // シーケンス番号をインクリメント
-        self.sequence_number += 1;
-
-        Ok(plaintext)
+        // 認証タグを検証して復号
+        match key.open_in_place(nonce, Aad::from(&aad), &mut plaintext[..]) {
+            Ok(_) => {
+                Ok(plaintext)
+            },
+            Err(e) => {
+                Err(anyhow::anyhow!("Failed to decrypt: {}", e))
+            }
+        }
     }
 
     pub fn encrypt_application_data(&self, plaintext: &[u8]) -> Vec<u8> {
@@ -716,21 +731,33 @@ impl KeySchedule {
         let nonce = Nonce::try_assume_unique_for_key(nonce)
             .map_err(|e| anyhow::anyhow!("Failed to create nonce: {}", e))?;
         
-        // 認証タグの長さを取得
-        let tag_len = self.cipher_suite.tag_len();
-        if ciphertext.len() < tag_len {
-            return Err(anyhow::anyhow!("Ciphertext too short"));
-        }
-        
-        // 暗号文と認証タグを分離
-        let (ciphertext_data, _tag) = ciphertext.split_at(ciphertext.len() - tag_len);
-        let mut plaintext = ciphertext_data.to_vec();
+        let mut plaintext = ciphertext.to_vec();
         
         // 認証タグを検証して復号
         key.open_in_place(nonce, Aad::from(aad), &mut plaintext)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt: {}", e))?;
         
         Ok(plaintext)
+    }
+
+    pub fn increment_sequence_number(&mut self) {
+        self.receive_sequence_number += 1;
+    }
+
+    pub fn create_close_notify(&mut self) -> Result<Vec<u8>> {
+        // 平文のAlertメッセージを作成
+        let mut plain_message = Vec::new();
+        plain_message.push(0x15); // Alert
+        plain_message.push(0x00); // length (2 bytes)
+        plain_message.push(0x00);
+        plain_message.push(0x02); // Alert length
+        plain_message.push(0x01); // AlertLevel: warning
+        plain_message.push(0x00); // AlertDescription: close_notify
+
+        // 暗号化
+        let encrypted_message = self.encrypt_handshake(&plain_message)?;
+
+        Ok(encrypted_message)
     }
 }
 
