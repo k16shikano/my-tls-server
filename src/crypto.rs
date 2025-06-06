@@ -5,9 +5,12 @@ use ring::{
     digest,
     hmac,
 };
-use p256::{ecdsa::SigningKey, SecretKey};
-use sha2::{Sha256, Digest};
-use p256::ecdsa::signature::Signer;
+use p256::{ecdsa::SigningKey as P256SigningKey, SecretKey as P256SecretKey};
+use p384::{ecdsa::SigningKey as P384SigningKey, SecretKey as P384SecretKey};
+use p256::ecdsa::signature::Signer as P256Signer;
+use p384::ecdsa::signature::Signer as P384Signer;
+use p256::ecdsa::{VerifyingKey as P256VerifyingKey, signature::Verifier as P256Verifier};
+use p384::ecdsa::{VerifyingKey as P384VerifyingKey, signature::Verifier as P384Verifier};
 
 pub fn hkdf_label<'a>(label: &'a str, context: &'a [u8], len: usize) -> Vec<&'a [u8]> {
     let mut out = Vec::new();
@@ -59,6 +62,7 @@ pub struct KeySchedule {
     server_hs_traffic: Vec<u8>,
     cipher_suite: &'static ring::aead::Algorithm,
     digest_alg: &'static ring::digest::Algorithm,
+    signature_alg: u16,  // 署名アルゴリズム（例：0x0403 for ecdsa_secp256r1_sha256）
     sequence_number: u64,
 }
 
@@ -107,7 +111,7 @@ pub enum KeyStage {
 
 #[allow(dead_code)]
 impl KeySchedule {
-    pub fn new(shared_secret: &[u8], transcript_hash: &[u8], cipher_suite: u16) -> Result<Self> {
+    pub fn new(shared_secret: &[u8], transcript_hash: &[u8], cipher_suite: u16, signature_alg: u16) -> Result<Self> {
         let aead_alg = aead_alg_from_suite(cipher_suite);
         let hkdf_alg = hkdf_alg_from_suite(cipher_suite);
         let hash_len = hkdf_alg.len();
@@ -184,6 +188,7 @@ impl KeySchedule {
             server_hs_traffic,
             cipher_suite: aead_alg,
             digest_alg,
+            signature_alg,
             sequence_number: 0,
         })
     }
@@ -429,50 +434,59 @@ impl KeySchedule {
         }
     }
 
-    pub fn create_certificate(&mut self) -> Result<Vec<u8>> {
+    pub fn create_certificate(&mut self) -> Result<(Vec<u8>, Vec<u8>)> {
         // 平文のCertificateメッセージを作成
-        let mut message = Vec::new();
-        message.push(0x0b); // HandshakeType::Certificate
-        message.push(0x00); // length (3 bytes)
-        message.push(0x00);
-        message.push(0x00);
+        let mut plain_message = Vec::new();
+        plain_message.push(0x0b); // HandshakeType::Certificate
+        plain_message.push(0x00); // length (3 bytes)
+        plain_message.push(0x00);
+        plain_message.push(0x00);
 
         // Certificate request context length (0 for server certificates)
-        message.push(0x00);
+        plain_message.push(0x00);
 
         // Certificate list length (will be updated later)
-        let cert_list_start = message.len();
-        message.extend_from_slice(&[0x00, 0x00, 0x00]);
+        let cert_list_start = plain_message.len();
+        plain_message.extend_from_slice(&[0x00, 0x00, 0x00]);
 
         // Certificate entry
-        let cert = include_bytes!("../server.der");
+        let cert = match self.signature_alg {
+            0x0403 => std::fs::read("server.der")
+                .map_err(|e| anyhow::anyhow!("Failed to read certificate: {}", e))?,
+            0x0503 => std::fs::read("server384.der")
+                .map_err(|e| anyhow::anyhow!("Failed to read certificate: {}", e))?,
+            _ => std::fs::read("server.der")
+                .map_err(|e| anyhow::anyhow!("Failed to read certificate: {}", e))?, // デフォルトはP-256の証明書
+        };
         let cert_len = cert.len();
 
         // Certificate data length (3 bytes)
-        message.push(((cert_len >> 16) & 0xff) as u8);
-        message.push(((cert_len >> 8) & 0xff) as u8);
-        message.push((cert_len & 0xff) as u8);
+        plain_message.push(((cert_len >> 16) & 0xff) as u8);
+        plain_message.push(((cert_len >> 8) & 0xff) as u8);
+        plain_message.push((cert_len & 0xff) as u8);
 
         // Certificate data
-        message.extend_from_slice(cert);
+        plain_message.extend_from_slice(&cert);
 
         // Certificate extensions length (0 for now)
-        message.extend_from_slice(&[0x00, 0x00]);
+        plain_message.extend_from_slice(&[0x00, 0x00]);
 
         // Update certificate list length
-        let cert_list_len = message.len() - cert_list_start - 3; // Subtract the 3-byte length field itself
-        message[cert_list_start] = ((cert_list_len >> 16) & 0xff) as u8;
-        message[cert_list_start + 1] = ((cert_list_len >> 8) & 0xff) as u8;
-        message[cert_list_start + 2] = (cert_list_len & 0xff) as u8;
+        let cert_list_len = plain_message.len() - cert_list_start - 3; // Subtract the 3-byte length field itself
+        plain_message[cert_list_start] = ((cert_list_len >> 16) & 0xff) as u8;
+        plain_message[cert_list_start + 1] = ((cert_list_len >> 8) & 0xff) as u8;
+        plain_message[cert_list_start + 2] = (cert_list_len & 0xff) as u8;
 
         // Update total message length
-        let msg_len = message.len() - 4;
-        message[1] = ((msg_len >> 16) & 0xff) as u8;
-        message[2] = ((msg_len >> 8) & 0xff) as u8;
-        message[3] = (msg_len & 0xff) as u8;
+        let msg_len = plain_message.len() - 4;
+        plain_message[1] = ((msg_len >> 16) & 0xff) as u8;
+        plain_message[2] = ((msg_len >> 8) & 0xff) as u8;
+        plain_message[3] = (msg_len & 0xff) as u8;
 
         // 暗号化
-        self.encrypt_handshake(&message, 0x0b)
+        let encrypted_message = self.encrypt_handshake(&plain_message, 0x0b)?;
+
+        Ok((encrypted_message, plain_message))
     }
 
     pub fn create_certificate_verify(&mut self, transcript_hash: &[u8]) -> Result<Vec<u8>> {
@@ -483,8 +497,9 @@ impl KeySchedule {
         message.push(0x00);
         message.push(0x00);
 
-        // 署名アルゴリズム（ecdsa_secp256r1_sha256）
-        message.extend_from_slice(&[0x04, 0x03]);
+        // 署名アルゴリズムを設定
+        message.push((self.signature_alg >> 8) as u8);
+        message.push((self.signature_alg & 0xff) as u8);
 
         // Create the signature
         let signature = self.sign_certificate_verify(transcript_hash)?;
@@ -503,20 +518,23 @@ impl KeySchedule {
         message[2] = ((msg_len >> 8) & 0xff) as u8;
         message[3] = (msg_len & 0xff) as u8;
 
+        println!("CertificateVerify content: {:02x?}", message);
+
         // 暗号化
-        self.encrypt_handshake(&message, 0x0f)
+        let encrypted_message = self.encrypt_handshake(&message, 0x0f)?;
+
+        Ok(encrypted_message)
     }
 
-    fn sign_certificate_verify(&self, transcript_hash: &[u8]) -> Result<Vec<u8>> {
-        // Load private key from server.key file
-        let key_pem = std::fs::read_to_string("server.key")
-            .map_err(|e| anyhow::anyhow!("Failed to read private key: {}", e))?;
-
-        // Parse the ECDSA private key
-        let secret_key = SecretKey::from_sec1_pem(&key_pem)
-            .map_err(|e| anyhow::anyhow!("Failed to parse ECDSA private key: {}", e))?;
-
-        let signing_key = SigningKey::from(&secret_key);
+    pub fn sign_certificate_verify(&self, transcript_hash: &[u8]) -> Result<Vec<u8>> {
+        // Debug output for signature algorithm
+        println!("Selected signature algorithm: 0x{:04x}", self.signature_alg);
+        match self.signature_alg {
+            0x0403 => println!("Using ecdsa_secp256r1_sha256"),
+            0x0503 => println!("Using ecdsa_secp384r1_sha384"),
+            0x0804 => println!("Using rsa_pss_rsae_sha256"),
+            _ => println!("Unknown signature algorithm"),
+        }
 
         // Create the signature content according to TLS 1.3 spec (RFC 8446 section 4.4.3)
         let mut content = Vec::new();
@@ -533,15 +551,54 @@ impl KeySchedule {
         // Add the handshake context (hash of all handshake messages so far)
         content.extend_from_slice(transcript_hash);
 
-        // Hash the content with SHA256
-        let mut hasher = Sha256::new();
-        hasher.update(&content);
-        let hash = hasher.finalize();
+        // Sign the content using the selected signature algorithm
+        let signature = match self.signature_alg {
+            0x0403 => { // ecdsa_secp256r1_sha256
+                // Load P-256 private key
+                let key_pem = std::fs::read_to_string("server.key")
+                    .map_err(|e| anyhow::anyhow!("Failed to read private key: {}", e))?;
+                let secret_key = P256SecretKey::from_sec1_pem(&key_pem)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse ECDSA private key: {}", e))?;
+                let signing_key = P256SigningKey::from(&secret_key);
 
-        // Sign the hash
-        let signature: p256::ecdsa::Signature = signing_key.sign(&hash);
+                // 公開鍵を抽出して表示
+                let public_key = signing_key.verifying_key();
+                println!("Using P-256 public key: {:02x?}", public_key.to_encoded_point(false).as_bytes());
 
-        Ok(signature.to_vec())
+                // 署名を生成
+                let signature: p256::ecdsa::Signature = signing_key.sign(&content);
+                signature.to_der().as_bytes().to_vec()
+            },
+            0x0503 => { // ecdsa_secp384r1_sha384
+                // Load P-384 private key
+                let key_pem = std::fs::read_to_string("server384.key")
+                    .map_err(|e| anyhow::anyhow!("Failed to read private key: {}", e))?;
+                let secret_key = P384SecretKey::from_sec1_pem(&key_pem)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse ECDSA private key: {}", e))?;
+                let signing_key = P384SigningKey::from(&secret_key);
+
+                // 公開鍵を抽出して表示
+                let public_key = signing_key.verifying_key();
+                println!("Using P-384 public key: {:02x?}", public_key.to_encoded_point(false).as_bytes());
+
+                // 署名を生成
+                let signature: p384::ecdsa::Signature = signing_key.sign(&content);
+                signature.to_der().as_bytes().to_vec()
+            },
+            0x0804 => { // rsa_pss_rsae_sha256
+                // TODO: RSA-PSSの実装
+                return Err(anyhow::anyhow!("RSA-PSS not supported yet"));
+            },
+            _ => {
+                return Err(anyhow::anyhow!("Unsupported signature algorithm: {:04x}", self.signature_alg));
+            }
+        };
+
+        // Debug output
+        println!("Signature content: {:02x?}", content);
+        println!("Signature (DER): {:02x?}", signature);
+
+        Ok(signature)
     }
 
     pub fn create_finished(&self, transcript_hash: &[u8]) -> Vec<u8> {
@@ -799,6 +856,8 @@ pub fn verify_x25519_public_key(public_key: &[u8]) -> bool {
 mod tests {
     use super::*;
     use ring::aead::{LessSafeKey, UnboundKey, Nonce, Aad};
+    use p256::ecdsa::{VerifyingKey as P256VerifyingKey, signature::Verifier as P256Verifier};
+    use p384::ecdsa::{VerifyingKey as P384VerifyingKey, signature::Verifier as P384Verifier};
 
     #[test]
     fn test_aead_decryption() {
@@ -838,6 +897,76 @@ mod tests {
         if let Ok(plaintext) = result {
             println!("Decrypted plaintext: {:02x?}", plaintext);
             println!("Decrypted plaintext length: {}", plaintext.len());
+        }
+    }
+
+    #[test]
+    fn test_certificate_verify_signature() {
+        // テスト用のトランスクリプトハッシュ
+        let transcript_hash = [
+            0x4e, 0xde, 0xf6, 0x7d, 0xe2, 0x44, 0x88, 0x24,
+            0x0b, 0x8f, 0x3c, 0x48, 0x57, 0x76, 0x66, 0xb6,
+            0x83, 0xe5, 0xbc, 0x54, 0xdb, 0xe5, 0x35, 0x40,
+            0x78, 0x03, 0x49, 0xe3, 0x1b, 0xf6, 0x85, 0xd7,
+            0xe2, 0x4e, 0xf0, 0xe5, 0xf9, 0x4f, 0xb3, 0x8c,
+            0x19, 0x9e, 0xf1, 0x16, 0x03, 0xc4, 0x94, 0x80
+        ];
+
+        // 署名対象データを構築（サーバーと同じ方法で）
+        let mut content = Vec::new();
+        content.extend_from_slice(&[0x20; 64]);
+        content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        content.push(0x00);
+        content.extend_from_slice(&transcript_hash);
+
+        // P-256のテスト
+        {
+            // サーバーの署名を生成
+            let key_schedule = KeySchedule::new(
+                &[0u8; 32], // ダミーの共有秘密
+                &transcript_hash,
+                0x1301, // AES_128_GCM
+                0x0403  // ecdsa_secp256r1_sha256
+            ).unwrap();
+            let server_signature = key_schedule.sign_certificate_verify(&transcript_hash).unwrap();
+
+            // クライアント側での検証
+            let key_pem = std::fs::read_to_string("server.key").unwrap();
+            let secret_key = P256SecretKey::from_sec1_pem(&key_pem).unwrap();
+            let signing_key = P256SigningKey::from(&secret_key);
+            let verifying_key = P256VerifyingKey::from(&signing_key);
+
+            // SHA256でハッシュを計算
+            let hash = digest::digest(&digest::SHA256, &content);
+            
+            // 署名を検証
+            let signature = p256::ecdsa::Signature::from_der(&server_signature).unwrap();
+            assert!(verifying_key.verify(hash.as_ref(), &signature).is_ok());
+        }
+
+        // P-384のテスト
+        {
+            // サーバーの署名を生成
+            let key_schedule = KeySchedule::new(
+                &[0u8; 32], // ダミーの共有秘密
+                &transcript_hash,
+                0x1302, // AES_256_GCM
+                0x0503  // ecdsa_secp384r1_sha384
+            ).unwrap();
+            let server_signature = key_schedule.sign_certificate_verify(&transcript_hash).unwrap();
+
+            // クライアント側での検証
+            let key_pem = std::fs::read_to_string("server384.key").unwrap();
+            let secret_key = P384SecretKey::from_sec1_pem(&key_pem).unwrap();
+            let signing_key = P384SigningKey::from(&secret_key);
+            let verifying_key = P384VerifyingKey::from(&signing_key);
+
+            // SHA384でハッシュを計算
+            let hash = digest::digest(&digest::SHA384, &content);
+            
+            // 署名を検証
+            let signature = p384::ecdsa::Signature::from_der(&server_signature).unwrap();
+            assert!(verifying_key.verify(hash.as_ref(), &signature).is_ok());
         }
     }
 } 

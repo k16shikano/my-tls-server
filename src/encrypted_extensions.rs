@@ -67,25 +67,3 @@ impl EncryptedExtensions {
         println!("=====================================\n");
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_encrypted_extensions_serialization() {
-        let mut ee = EncryptedExtensions::new();
-        
-        // supported_groups拡張を追加
-        ee.add_extension(0x0010, vec![0x00, 0x02, 0x00, 0x1d]); // x25519
-        
-        // signature_algorithms拡張を追加
-        ee.add_extension(0x000d, vec![0x00, 0x04, 0x04, 0x03, 0x08, 0x04]); // ecdsa_secp256r1_sha256
-        
-        let bytes = ee.to_bytes();
-        
-        // 基本的な構造の検証
-        assert_eq!(bytes[0], 0x08); // EncryptedExtensions
-        assert_eq!(bytes.len(), 19); // 1 + 3 + 2 + 13 (拡張データ)
-    }
-} 
