@@ -48,21 +48,6 @@ async fn main() -> Result<()> {
     let client_hello = handshake::ClientHello::from_bytes(&record.fragment)
         .ok_or_else(|| anyhow::anyhow!("Invalid ClientHello"))?;
 
-    println!("\n=== ClientHello Extensions ===");
-    for ext in &client_hello.extensions {
-        match ext.extension_type {
-            0x002b => println!("supported_versions: {:02x?}", ext.extension_data),
-            0x000a => println!("supported_groups: {:02x?}", ext.extension_data),
-            0x000d => println!("signature_algorithms: {:02x?}", ext.extension_data),
-            0x0033 => println!("key_share: {:02x?}", ext.extension_data),
-            0x0029 => println!("pre_shared_key: {:02x?}", ext.extension_data),
-            0x002a => println!("early_data: {:02x?}", ext.extension_data),
-            0x0031 => println!("post_handshake_auth: {:02x?}", ext.extension_data),
-            _ => println!("Other extension (0x{:04x}): {:02x?}", ext.extension_type, ext.extension_data),
-        }
-    }
-    println!("=============================\n");
-
     // 鍵交換の準備
     let rng = SystemRandom::new();
     let private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
@@ -130,9 +115,6 @@ async fn main() -> Result<()> {
     let selected_signature_alg = selected_signature_alg
         .ok_or_else(|| anyhow::anyhow!("No supported signature algorithm found"))?;
 
-    println!("Selected cipher suite: 0x{:04x}", selected_cipher_suite);
-    println!("Selected signature algorithm: 0x{:04x}", selected_signature_alg);
-
     // ServerHelloメッセージの構築
     let server_hello = server_hello::ServerHello::new(
         0x0303, // TLS 1.2
@@ -171,8 +153,6 @@ async fn main() -> Result<()> {
     let hkdf_alg = crypto::hkdf_alg_from_suite(selected_cipher_suite);
     let digest_alg = crypto::digest_alg_from_hkdf(hkdf_alg);
     let mut transcript_hash = digest::digest(digest_alg, &handshake_messages_till_sh);
-
-    println!("handshake_messages_till_sh: {:02x?}", handshake_messages_till_sh);
 
     // ServerHelloの送信
     let server_hello_record = record::TLSPlaintext::new(
@@ -232,7 +212,7 @@ async fn main() -> Result<()> {
                 break;
             }
             _ => {
-                println!("Skipping unsupported group_id 0x{:04x}", group_id);
+                // サポートされていないグループIDはスキップ
             }
         }
         offset += key_length as usize;
@@ -270,42 +250,27 @@ async fn main() -> Result<()> {
     // EncryptedExtensions
     let mut encrypted_extensions = encrypted_extensions::EncryptedExtensions::new();
     
-    // supported_versions拡張は送信しない
-    // let mut supported_versions = Vec::new();
-    // supported_versions.push(0x03); // TLS 1.3
-    // supported_versions.push(0x04);
-    // encrypted_extensions.add_extension(0x002b, supported_versions);
-    
     // クライアントの拡張に基づいて応答を生成
     for ext in &client_hello.extensions {
         match ext.extension_type {
             0x0029 => { // pre_shared_key
-                // クライアントがpre_shared_keyを要求した場合、応答に含める
                 encrypted_extensions.add_extension(0x0029, vec![]);
             },
             0x002a => { // early_data
-                // クライアントがearly_dataを要求した場合、応答に含める
                 encrypted_extensions.add_extension(0x002a, vec![]);
             },
             0x0031 => { // post_handshake_auth
-                // クライアントがpost_handshake_authを要求した場合、応答に含める
                 encrypted_extensions.add_extension(0x0031, vec![]);
             },
             _ => {
-                // その他の拡張は無視
-                println!("Ignoring unsupported extension: 0x{:04x}", ext.extension_type);
+                // サポートされていない拡張はスキップ
             }
         }
     }
     
-    // 応答する拡張の一覧を表示
-    encrypted_extensions.print_extensions();
-    
     let encrypted_extensions_bytes = encrypted_extensions.to_bytes();
-    println!("EncryptedExtensions bytes: {:02x?}", encrypted_extensions_bytes);
-    let encrypted_extensions_record = key_schedule.encrypt_handshake(&encrypted_extensions_bytes, 0x08)?;
+    let encrypted_extensions_record = key_schedule.encrypt_handshake(&encrypted_extensions_bytes)?;
     socket.write_all(&encrypted_extensions_record).await?;
-    println!("SENT: EncryptedExtensions: {:02x?}", encrypted_extensions_record);
 
     // トランスクリプトハッシュの更新（EncryptedExtensionsを追加）
     let mut handshake_messages = handshake_messages_till_sh.clone();
@@ -314,30 +279,23 @@ async fn main() -> Result<()> {
     // Certificate
     let (certificate, plain_certificate) = key_schedule.create_certificate()?;
     socket.write_all(&certificate).await?;
-    println!("SENT: Certificate: {:02x?}", certificate);
 
     // トランスクリプトハッシュの更新（Certificateを追加）
     handshake_messages.extend_from_slice(&plain_certificate);
     transcript_hash = digest::digest(digest_alg, &handshake_messages);
     
     // CertificateVerify
-    println!("Handshake messages for CertificateVerify: {:02x?}", handshake_messages);
-    println!("Handshake messages length: {}", handshake_messages.len());
-    println!("Transcript hash: {:02x?}", transcript_hash);
     let (certificate_verify, plain_certificate_verify) = key_schedule.create_certificate_verify(transcript_hash.as_ref())?;
     socket.write_all(&certificate_verify).await?;
-    println!("SENT: CertificateVerify: {:02x?}", certificate_verify);
     
     // トランスクリプトハッシュの更新（CertificateVerifyを追加）
     handshake_messages.extend_from_slice(&plain_certificate_verify);
     transcript_hash = digest::digest(digest_alg, &handshake_messages);
-    println!("Updated transcript hash for Finished: {:02x?}", transcript_hash);
     
     // Finished
     let finished = key_schedule.create_finished(transcript_hash.as_ref());
-    let encrypted_finished = key_schedule.encrypt_handshake(&finished, 0x14)?;
+    let encrypted_finished = key_schedule.encrypt_handshake(&finished)?;
     socket.write_all(&encrypted_finished).await?;
-    println!("SENT: Finished: {:02x?}", encrypted_finished);
 
     // クライアントのFinishedを待機
     let mut buffer = [0u8; 4096];

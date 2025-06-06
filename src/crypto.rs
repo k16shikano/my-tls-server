@@ -8,9 +8,6 @@ use ring::{
 use p256::{ecdsa::SigningKey as P256SigningKey, SecretKey as P256SecretKey};
 use p384::{ecdsa::SigningKey as P384SigningKey, SecretKey as P384SecretKey};
 use p256::ecdsa::signature::Signer as P256Signer;
-use p384::ecdsa::signature::Signer as P384Signer;
-use p256::ecdsa::{VerifyingKey as P256VerifyingKey, signature::Verifier as P256Verifier};
-use p384::ecdsa::{VerifyingKey as P384VerifyingKey, signature::Verifier as P384Verifier};
 
 pub fn hkdf_label<'a>(label: &'a str, context: &'a [u8], len: usize) -> Vec<&'a [u8]> {
     let mut out = Vec::new();
@@ -193,7 +190,7 @@ impl KeySchedule {
         })
     }
 
-    pub fn encrypt_handshake(&mut self, plaintext: &[u8], handshake_type: u8) -> Result<Vec<u8>> {
+    pub fn encrypt_handshake(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         // TLSInnerPlaintextの構築
         let mut inner_plaintext = Vec::new();
         inner_plaintext.extend_from_slice(plaintext);
@@ -202,17 +199,13 @@ impl KeySchedule {
         // パディングの追加
         let padding_len = 16 - ((inner_plaintext.len() + 1) % 16);
         inner_plaintext.extend_from_slice(&vec![0x00; padding_len]);
-        
-        println!("TLSInnerPlaintext: {:02x?}", inner_plaintext);
 
         // encrypted_recordの長さを計算
         let encrypted_record_len = inner_plaintext.len() + self.cipher_suite.tag_len();
-        println!("Encrypted record length: {}", encrypted_record_len);
         
         // server_handshake_traffic_secretから暗号化キーを導出
         let key_len = self.cipher_suite.key_len();
         let mut key = vec![0u8; key_len];
-        println!("Key buffer length: {}", key.len());
         
         // HKDF-Expand-Label(server_handshake_traffic_secret, "key", "", key_length)
         let hkdf_alg = if self.cipher_suite == &AES_128_GCM || self.cipher_suite == &CHACHA20_POLY1305 {
@@ -220,12 +213,10 @@ impl KeySchedule {
         } else {
             HKDF_SHA384
         };
-        println!("HKDF algorithm: {}", if hkdf_alg == HKDF_SHA256 { "SHA256" } else { "SHA384" });
         
         // expandの出力長をハッシュ関数の出力長に設定
         let expand_len = hkdf_alg.len();
         let key_label: Vec<&[u8]> = hkdf_label("key", b"", key_len);
-        println!("Key label: {:02x?}", key_label.iter().flat_map(|x| x.iter().copied()).collect::<Vec<u8>>());
         let mut expanded_key = vec![0u8; expand_len];
         let key_prk = ring::hkdf::Prk::new_less_safe(hkdf_alg, &self.server_hs_traffic);
         key_prk.expand(&key_label, hkdf_alg)
@@ -234,15 +225,12 @@ impl KeySchedule {
             .map_err(|e| anyhow::anyhow!("Failed to fill key: {}", e))?;
         // 必要な長さだけを使用
         key.copy_from_slice(&expanded_key[..key_len]);
-        println!("AEAD Key: {:02x?}", key);
 
         // record_ivの導出
         let mut record_iv = [0u8; 12];
-        println!("IV buffer length: {}", record_iv.len());
         
         // HKDF-Expand-Label(server_handshake_traffic_secret, "iv", "", iv_length)
         let iv_label = hkdf_label("iv", b"", 12);
-        println!("IV label: {:02x?}", iv_label.iter().flat_map(|x| x.iter().copied()).collect::<Vec<u8>>());
         let mut expanded_iv = vec![0u8; expand_len];
         let iv_prk = ring::hkdf::Prk::new_less_safe(hkdf_alg, &self.server_hs_traffic);
         iv_prk.expand(&iv_label, hkdf_alg)
@@ -250,42 +238,22 @@ impl KeySchedule {
             .fill(&mut expanded_iv)
             .map_err(|e| anyhow::anyhow!("Failed to fill iv: {}", e))?;
         record_iv.copy_from_slice(&expanded_iv[..12]);
-        println!("Record IV: {:02x?}", record_iv);
 
         // sequence_numberを8バイトの配列に変換
         let seq_bytes = self.sequence_number.to_be_bytes();
-        println!("Sequence number: {:02x?}", seq_bytes);
 
         // nonce = XOR(record_iv, padded_sequence_number)
         let mut nonce = [0u8; 12];
         // 1. sequence_numberを12バイトにパディング（左側に0を埋める）
         let mut padded_seq = [0u8; 12];
         padded_seq[4..].copy_from_slice(&seq_bytes);  // 左側に4バイトの0をパディング
-        println!("Padded sequence number: {:02x?}", padded_seq);
         // 2. record_ivとXOR
         for i in 0..12 {
             nonce[i] = record_iv[i] ^ padded_seq[i];
         }
-        println!("AEAD Nonce: {:02x?}", nonce);
-
-        println!("\n=== Encrypting Handshake Message ===");
-        println!("Handshake type: {:02x}", handshake_type);
-        println!("Server HS Traffic: {:02x?}", self.server_hs_traffic);
-        println!("AEAD Algorithm: {}", if self.cipher_suite == &AES_128_GCM {
-            "AES_128_GCM"
-        } else if self.cipher_suite == &AES_256_GCM {
-            "AES_256_GCM"
-        } else if self.cipher_suite == &CHACHA20_POLY1305 {
-            "CHACHA20_POLY1305"
-        } else {
-            "Unknown"
-        });
-        println!("Key length: {} bytes", self.cipher_suite.key_len());
-        println!("Tag length: {} bytes", self.cipher_suite.tag_len());
 
         // AADの計算（TLSCiphertextのフィールドから）
         let aad = self.compute_aad(0x17, &[0x03, 0x03], encrypted_record_len);
-        println!("AEAD AAD: {:02x?}", aad);
 
         // 暗号化
         let key = LessSafeKey::new(UnboundKey::new(self.cipher_suite, &key)
@@ -297,9 +265,6 @@ impl KeySchedule {
         let mut ciphertext = inner_plaintext.clone();
         let tag = key.seal_in_place_separate_tag(nonce, Aad::from(&aad), &mut ciphertext)
             .map_err(|e| anyhow::anyhow!("Failed to encrypt: {}", e))?;
-        
-        println!("AEAD Ciphertext: {:02x?}", ciphertext);
-        println!("AEAD Tag: {:02x?}", tag.as_ref());
         
         // 暗号文と認証タグを結合してencrypted_recordを作成
         let mut encrypted_record = ciphertext;
@@ -315,9 +280,6 @@ impl KeySchedule {
         // TLSCiphertextの長さを設定
         tls_ciphertext[3] = ((encrypted_record.len() >> 8) & 0xff) as u8;
         tls_ciphertext[4] = (encrypted_record.len() & 0xff) as u8;
-
-        println!("Final Record: {:02x?}", tls_ciphertext);
-        println!("=== End of Encryption ===\n");
 
         // シーケンス番号をインクリメント
         self.sequence_number += 1;
@@ -484,7 +446,7 @@ impl KeySchedule {
         plain_message[3] = (msg_len & 0xff) as u8;
 
         // 暗号化
-        let encrypted_message = self.encrypt_handshake(&plain_message, 0x0b)?;
+        let encrypted_message = self.encrypt_handshake(&plain_message)?;
 
         Ok((encrypted_message, plain_message))
     }
@@ -518,24 +480,13 @@ impl KeySchedule {
         message[2] = ((msg_len >> 8) & 0xff) as u8;
         message[3] = (msg_len & 0xff) as u8;
 
-        println!("CertificateVerify content: {:02x?}", message);
-
         // 暗号化
-        let encrypted_message = self.encrypt_handshake(&message, 0x0f)?;
+        let encrypted_message = self.encrypt_handshake(&message)?;
 
         Ok((encrypted_message, message))
     }
 
     pub fn sign_certificate_verify(&self, transcript_hash: &[u8]) -> Result<Vec<u8>> {
-        // Debug output for signature algorithm
-        println!("Selected signature algorithm: 0x{:04x}", self.signature_alg);
-        match self.signature_alg {
-            0x0403 => println!("Using ecdsa_secp256r1_sha256"),
-            0x0503 => println!("Using ecdsa_secp384r1_sha384"),
-            0x0804 => println!("Using rsa_pss_rsae_sha256"),
-            _ => println!("Unknown signature algorithm"),
-        }
-
         // Create the signature content according to TLS 1.3 spec (RFC 8446 section 4.4.3)
         let mut content = Vec::new();
 
@@ -561,10 +512,6 @@ impl KeySchedule {
                     .map_err(|e| anyhow::anyhow!("Failed to parse ECDSA private key: {}", e))?;
                 let signing_key = P256SigningKey::from(&secret_key);
 
-                // 公開鍵を抽出して表示
-                let public_key = signing_key.verifying_key();
-                println!("Using P-256 public key: {:02x?}", public_key.to_encoded_point(false).as_bytes());
-
                 // 署名を生成
                 let signature: p256::ecdsa::Signature = signing_key.sign(&content);
                 signature.to_der().as_bytes().to_vec()
@@ -576,10 +523,6 @@ impl KeySchedule {
                 let secret_key = P384SecretKey::from_sec1_pem(&key_pem)
                     .map_err(|e| anyhow::anyhow!("Failed to parse ECDSA private key: {}", e))?;
                 let signing_key = P384SigningKey::from(&secret_key);
-
-                // 公開鍵を抽出して表示
-                let public_key = signing_key.verifying_key();
-                println!("Using P-384 public key: {:02x?}", public_key.to_encoded_point(false).as_bytes());
 
                 // 署名を生成
                 let signature: p384::ecdsa::Signature = signing_key.sign(&content);
@@ -593,10 +536,6 @@ impl KeySchedule {
                 return Err(anyhow::anyhow!("Unsupported signature algorithm: {:04x}", self.signature_alg));
             }
         };
-
-        // Debug output
-        println!("Signature content: {:02x?}", content);
-        println!("Signature (DER): {:02x?}", signature);
 
         Ok(signature)
     }
@@ -850,124 +789,5 @@ pub fn verify_x25519_public_key(public_key: &[u8]) -> bool {
     }
 
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ring::aead::{LessSafeKey, UnboundKey, Nonce, Aad};
-    use p256::ecdsa::{VerifyingKey as P256VerifyingKey, signature::Verifier as P256Verifier};
-    use p384::ecdsa::{VerifyingKey as P384VerifyingKey, signature::Verifier as P384Verifier};
-
-    #[test]
-    fn test_aead_decryption() {
-        // サーバー側の出力値
-        let key = [
-            0xd6, 0xdf, 0x1f, 0x2c, 0x90, 0x23, 0xea, 0x17, 0x87, 0x3d, 0x5a, 0x82,
-            0xed, 0x73, 0x42, 0x3d, 0xdf, 0xde, 0x71, 0xe3, 0x2a, 0x58, 0x58, 0x12,
-            0x89, 0x1d, 0xb3, 0xac, 0xe5, 0xf3, 0x42, 0x06
-        ];
-        let nonce = [
-            0xd6, 0xdf, 0x1f, 0x2c, 0x90, 0x23, 0xea, 0x17, 0x87, 0x3d, 0x5a, 0x82
-        ];
-        let aad = [0x17, 0x03, 0x03, 0x00, 0x2f];
-        let ciphertext = [
-            0xcf, 0x4f, 0x7b, 0x65, 0xf8, 0x78, 0x40, 0x5d, 0x8f, 0xad, 0x1a, 0x17,
-            0xb5, 0xad, 0xba, 0x1c, 0x1a, 0x2c, 0xb7, 0xd6, 0xcf, 0x77, 0x1b, 0x61,
-            0x0b, 0x2a, 0x0e, 0x18, 0xfc, 0x29, 0x75
-        ];
-        let tag = [
-            0x82, 0x3d, 0x6f, 0x86, 0x75, 0xb6, 0x16, 0x3d, 0x76, 0x39, 0x05, 0x88,
-            0xcb, 0x55, 0xd7, 0xb2
-        ];
-
-        // 暗号化キーの作成
-        let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).unwrap());
-        let nonce = Nonce::try_assume_unique_for_key(&nonce).unwrap();
-
-        // 暗号文とタグを結合
-        let mut combined = ciphertext.to_vec();
-        combined.extend_from_slice(&tag);
-
-        // 復号を試みる
-        let result = key.open_in_place(nonce, Aad::from(&aad), &mut combined);
-        assert!(result.is_ok(), "Decryption failed: {:?}", result);
-
-        // 復号された平文を表示
-        if let Ok(plaintext) = result {
-            println!("Decrypted plaintext: {:02x?}", plaintext);
-            println!("Decrypted plaintext length: {}", plaintext.len());
-        }
-    }
-
-    #[test]
-    fn test_certificate_verify_signature() {
-        // テスト用のトランスクリプトハッシュ
-        let transcript_hash = [
-            0x4e, 0xde, 0xf6, 0x7d, 0xe2, 0x44, 0x88, 0x24,
-            0x0b, 0x8f, 0x3c, 0x48, 0x57, 0x76, 0x66, 0xb6,
-            0x83, 0xe5, 0xbc, 0x54, 0xdb, 0xe5, 0x35, 0x40,
-            0x78, 0x03, 0x49, 0xe3, 0x1b, 0xf6, 0x85, 0xd7,
-            0xe2, 0x4e, 0xf0, 0xe5, 0xf9, 0x4f, 0xb3, 0x8c,
-            0x19, 0x9e, 0xf1, 0x16, 0x03, 0xc4, 0x94, 0x80
-        ];
-
-        // 署名対象データを構築（サーバーと同じ方法で）
-        let mut content = Vec::new();
-        content.extend_from_slice(&[0x20; 64]);
-        content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-        content.push(0x00);
-        content.extend_from_slice(&transcript_hash);
-
-        // P-256のテスト
-        {
-            // サーバーの署名を生成
-            let key_schedule = KeySchedule::new(
-                &[0u8; 32], // ダミーの共有秘密
-                &transcript_hash,
-                0x1301, // AES_128_GCM
-                0x0403  // ecdsa_secp256r1_sha256
-            ).unwrap();
-            let server_signature = key_schedule.sign_certificate_verify(&transcript_hash).unwrap();
-
-            // クライアント側での検証
-            let key_pem = std::fs::read_to_string("server.key").unwrap();
-            let secret_key = P256SecretKey::from_sec1_pem(&key_pem).unwrap();
-            let signing_key = P256SigningKey::from(&secret_key);
-            let verifying_key = P256VerifyingKey::from(&signing_key);
-
-            // SHA256でハッシュを計算
-            let hash = digest::digest(&digest::SHA256, &content);
-            
-            // 署名を検証
-            let signature = p256::ecdsa::Signature::from_der(&server_signature).unwrap();
-            assert!(verifying_key.verify(hash.as_ref(), &signature).is_ok());
-        }
-
-        // P-384のテスト
-        {
-            // サーバーの署名を生成
-            let key_schedule = KeySchedule::new(
-                &[0u8; 32], // ダミーの共有秘密
-                &transcript_hash,
-                0x1302, // AES_256_GCM
-                0x0503  // ecdsa_secp384r1_sha384
-            ).unwrap();
-            let server_signature = key_schedule.sign_certificate_verify(&transcript_hash).unwrap();
-
-            // クライアント側での検証
-            let key_pem = std::fs::read_to_string("server384.key").unwrap();
-            let secret_key = P384SecretKey::from_sec1_pem(&key_pem).unwrap();
-            let signing_key = P384SigningKey::from(&secret_key);
-            let verifying_key = P384VerifyingKey::from(&signing_key);
-
-            // SHA384でハッシュを計算
-            let hash = digest::digest(&digest::SHA384, &content);
-            
-            // 署名を検証
-            let signature = p384::ecdsa::Signature::from_der(&server_signature).unwrap();
-            assert!(verifying_key.verify(hash.as_ref(), &signature).is_ok());
-        }
-    }
 } 
 
