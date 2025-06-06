@@ -2,6 +2,8 @@
 *.key
 *.pem
 *.der
+*.crt
+*.csr
 
 # log file
 *.log
