@@ -46,24 +46,7 @@ impl EncryptedExtensions {
         bytes.extend_from_slice(&[(extensions_data.len() >> 8) as u8, extensions_data.len() as u8]);  // extensions length
         bytes.extend_from_slice(&extensions_data);  // extensions data
         
-        println!("EncryptedExtensions message: {:02x?}", bytes);
         bytes
     }
 
-    pub fn print_extensions(&self) {
-        println!("\n=== EncryptedExtensions Extensions ===");
-        for ext in &self.extensions {
-            match ext.extension_type {
-                0x002b => println!("supported_versions: {:02x?}", ext.extension_data),
-                0x000a => println!("supported_groups: {:02x?}", ext.extension_data),
-                0x000d => println!("signature_algorithms: {:02x?}", ext.extension_data),
-                0x0033 => println!("key_share: {:02x?}", ext.extension_data),
-                0x0029 => println!("pre_shared_key: {:02x?}", ext.extension_data),
-                0x002a => println!("early_data: {:02x?}", ext.extension_data),
-                0x0031 => println!("post_handshake_auth: {:02x?}", ext.extension_data),
-                _ => println!("Other extension (0x{:04x}): {:02x?}", ext.extension_type, ext.extension_data),
-            }
-        }
-        println!("=====================================\n");
-    }
 }
