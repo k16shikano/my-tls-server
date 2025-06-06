@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
-ring = "0.17.7"
 anyhow = "1.0"
-p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+ring = "0.17"
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = "0.13"
 sha2 = "0.10"

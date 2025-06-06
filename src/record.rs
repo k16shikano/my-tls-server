@@ -1,6 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ContentType {
-    Invalid = 0,
     ChangeCipherSpec = 20,
     Alert = 21,
     Handshake = 22,
@@ -33,34 +32,34 @@ impl TLSPlaintext {
         out
     }
 
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 5 {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 5 {
+            println!("Record too short: {} bytes", bytes.len());
             return None;
         }
 
-        let content_type = match data[0] {
-            20 => ContentType::ChangeCipherSpec,
-            21 => ContentType::Alert,
-            22 => ContentType::Handshake,
-            23 => ContentType::ApplicationData,
-            _ => ContentType::Invalid,
+        let content_type = match bytes[0] {
+            0x14 => ContentType::ChangeCipherSpec,
+            0x15 => ContentType::Alert,
+            0x16 => ContentType::Handshake,
+            0x17 => ContentType::ApplicationData,
+            _ => {
+                println!("Unknown content type: {:02x}", bytes[0]);
+                return None;
+            }
         };
 
-        if content_type == ContentType::Invalid {
-            return None;
-        }
+        let legacy_record_version = [bytes[1], bytes[2]];
+        let length = ((bytes[3] as usize) << 8) | (bytes[4] as usize);
 
-        let legacy_record_version = [data[1], data[2]];
-        let length = ((data[3] as usize) << 8) | (data[4] as usize);
-
-        if data.len() < 5 + length {
+        if bytes.len() < 5 + length {
             return None;
         }
 
         Some(Self {
             content_type,
             legacy_record_version,
-            fragment: data[5..5 + length].to_vec(),
+            fragment: bytes[5..5 + length].to_vec(),
         })
     }
 } 

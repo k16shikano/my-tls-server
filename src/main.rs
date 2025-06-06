@@ -24,14 +24,28 @@ async fn main() -> Result<()> {
         }
     };
 
-    // クライアントの接続を待機
-    let (mut socket, _) = match listener.accept().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            return Err(anyhow::anyhow!("Failed to accept connection: {}", e));
-        }
-    };
+    println!("Server listening on 127.0.0.1:4433");
 
+    // 接続を継続的に受け付ける
+    loop {
+        match listener.accept().await {
+            Ok((socket, addr)) => {
+                println!("New connection from {}", addr);
+                // 各接続を新しいタスクで処理
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(socket).await {
+                        println!("Error handling connection from {}: {}", addr, e);
+                    }
+                });
+            }
+            Err(e) => {
+                println!("Failed to accept connection: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_connection(mut socket: tokio::net::TcpStream) -> Result<()> {
     // クライアントからのデータを読み込む
     let mut buffer = [0u8; 4096];
     let n = socket.read(&mut buffer).await?;
@@ -55,10 +69,7 @@ async fn main() -> Result<()> {
     let public_key = private_key.compute_public_key()
         .map_err(|e| anyhow::anyhow!("Failed to compute public key: {}", e))?;
 
-    // サーバーの公開鍵をそのまま使用
-    let _server_kx = public_key.as_ref().to_vec();
-
-    // サーバーの乱数を生成（クライアントの乱数をコピーするのではなく）
+    // サーバーの乱数を生成
     let mut server_random = [0u8; 32];
     rng.fill(&mut server_random)
         .map_err(|e: Unspecified| anyhow::anyhow!("Failed to generate server random: {:?}", e))?;
@@ -66,7 +77,6 @@ async fn main() -> Result<()> {
     // クライアントの暗号スイート提案から適切なものを選択
     let selected_cipher_suite = *client_hello.cipher_suites.iter()
         .find(|&&suite| {
-            // TLS 1.3の暗号スイートのみをサポート
             match suite {
                 0x1301 => true, // TLS_AES_128_GCM_SHA256
                 0x1302 => true, // TLS_AES_256_GCM_SHA384
@@ -309,8 +319,6 @@ async fn main() -> Result<()> {
 
         match record.content_type {
             record::ContentType::ChangeCipherSpec => {
-                // シーケンス番号をインクリメント
-                //key_schedule.increment_sequence_number();
                 offset += record.fragment.len() + 5;
                 continue;
             },
@@ -331,10 +339,33 @@ async fn main() -> Result<()> {
 
     println!("Handshake Finished!!");
 
-    // close_notifyアラートを送信
-    let close_notify = key_schedule.create_close_notify()?;
-    socket.write_all(&close_notify).await?;
-    println!("Sent close_notify alert");
+    // クライアントからのデータを継続的に待ち受ける
+    let mut buffer = [0u8; 4096];
+    loop {
+        match socket.read(&mut buffer).await {
+            Ok(0) => {
+                println!("Client closed connection");
+                break;
+            }
+            Ok(n) => {
+                println!("Received {} bytes from client", n);
+                // 受信したデータを処理
+                match key_schedule.decrypt_handshake(&buffer[..n]) {
+                    Ok(plaintext) => {
+                        println!("Decrypted message: {:02x?}", plaintext);
+                    }
+                    Err(e) => {
+                        println!("Failed to decrypt message: {}", e);
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Error reading from socket: {}", e);
+                break;
+            }
+        }
+    }
 
     Ok(())
 } 
