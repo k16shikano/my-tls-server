@@ -14,17 +14,30 @@ use ring::{
     error::Unspecified,
 };
 
+use std::env;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // TCPリスナーをポート4433で開始
-    let listener = match TcpListener::bind("127.0.0.1:4433").await {
+    // コマンドライン引数からアドレスとポート番号を取得
+    let args: Vec<String> = env::args().collect();
+    let (addr, port) = match args.len() {
+        1 => ("127.0.0.1".to_string(), 4433),
+        2 => ("127.0.0.1".to_string(), args[1].parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("Invalid port number"))?),
+        3 => (args[1].clone(), args[2].parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("Invalid port number"))?),
+        _ => return Err(anyhow::anyhow!("Usage: {} [address] [port]", args[0])),
+    };
+
+    // TCPリスナーを指定されたアドレスとポートで開始
+    let listener = match TcpListener::bind(format!("{}:{}", addr, port)).await {
         Ok(l) => l,
         Err(e) => {
             return Err(anyhow::anyhow!("Failed to start server: {}", e));
         }
     };
 
-    println!("Server listening on 127.0.0.1:4433");
+    println!("Server listening on {}:{}", addr, port);
 
     // 接続を継続的に受け付ける
     loop {
