@@ -38,7 +38,7 @@ openssl req -new -x509 -key server384.key -out server384.der -outform DER -subj 
 ## 実行
 
 ```bash
-cargo run --release
+cargo run
 ```
 
 サーバーはデフォルトで`127.0.0.1:4433`でリッスンします。
