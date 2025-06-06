@@ -91,6 +91,48 @@ async fn main() -> Result<()> {
         })
         .ok_or_else(|| anyhow::anyhow!("No supported TLS 1.3 cipher suite"))?;
 
+    // 暗号スイートに応じてサポートする署名アルゴリズムを決定
+    let supported_signature_algorithms = match selected_cipher_suite {
+        0x1302 => vec![0x0503], // TLS_AES_256_GCM_SHA384 → ecdsa_secp384r1_sha384
+        _ => vec![0x0403, 0x0804], // TLS_AES_128_GCM_SHA256/TLS_CHACHA20_POLY1305_SHA256 → ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256
+    };
+
+    // 署名アルゴリズムの選択
+    let signature_algorithms_ext = client_hello.extensions.iter()
+        .find(|ext| ext.extension_type == 0x000d) // signature_algorithms
+        .ok_or_else(|| anyhow::anyhow!("No signature_algorithms extension"))?;
+
+    // signature_algorithms拡張のデータ構造を解析
+    let ext_data = &signature_algorithms_ext.extension_data;
+    if ext_data.len() < 2 {
+        return Err(anyhow::anyhow!("Invalid signature_algorithms extension data: too short"));
+    }
+
+    // 署名アルゴリズムリストの長さを取得
+    let total_length = ((ext_data[0] as u16) << 8 | ext_data[1] as u16) as usize;
+    if total_length + 2 != ext_data.len() {
+        return Err(anyhow::anyhow!("Invalid signature_algorithms extension data length"));
+    }
+
+    // クライアントの署名アルゴリズムリストから、サーバーがサポートしているものを選択
+    let mut selected_signature_alg = None;
+    for i in (2..ext_data.len()).step_by(2) {
+        if i + 1 >= ext_data.len() {
+            break;
+        }
+        let alg = ((ext_data[i] as u16) << 8) | (ext_data[i + 1] as u16);
+        if supported_signature_algorithms.contains(&alg) {
+            selected_signature_alg = Some(alg);
+            break;
+        }
+    }
+
+    let selected_signature_alg = selected_signature_alg
+        .ok_or_else(|| anyhow::anyhow!("No supported signature algorithm found"))?;
+
+    println!("Selected cipher suite: 0x{:04x}", selected_cipher_suite);
+    println!("Selected signature algorithm: 0x{:04x}", selected_signature_alg);
+
     // ServerHelloメッセージの構築
     let server_hello = server_hello::ServerHello::new(
         0x0303, // TLS 1.2
@@ -128,7 +170,9 @@ async fn main() -> Result<()> {
     // トランスクリプトハッシュの計算（ClientHello + ServerHello）
     let hkdf_alg = crypto::hkdf_alg_from_suite(selected_cipher_suite);
     let digest_alg = crypto::digest_alg_from_hkdf(hkdf_alg);
-    let transcript_hash = digest::digest(digest_alg, &handshake_messages_till_sh);
+    let mut transcript_hash = digest::digest(digest_alg, &handshake_messages_till_sh);
+
+    println!("handshake_messages_till_sh: {:02x?}", handshake_messages_till_sh);
 
     // ServerHelloの送信
     let server_hello_record = record::TLSPlaintext::new(
@@ -215,9 +259,13 @@ async fn main() -> Result<()> {
         }
     ).map_err(|e: Unspecified| anyhow::anyhow!("Failed to compute shared secret: {:?}", e))?;
 
-    // 鍵スケジュールの初期化（正しいtranscript_hashを使用）
-    let mut key_schedule = crypto::KeySchedule::new(&shared_secret, transcript_hash.as_ref(), selected_cipher_suite)
-        .map_err(|e| anyhow::anyhow!("Failed to initialize key schedule: {}", e))?;
+    // 鍵スケジュールの初期化（選択した署名アルゴリズムを使用）
+    let mut key_schedule = crypto::KeySchedule::new(
+        &shared_secret,
+        transcript_hash.as_ref(),
+        selected_cipher_suite,
+        selected_signature_alg
+    ).map_err(|e| anyhow::anyhow!("Failed to initialize key schedule: {}", e))?;
 
     // EncryptedExtensions
     let mut encrypted_extensions = encrypted_extensions::EncryptedExtensions::new();
@@ -259,16 +307,32 @@ async fn main() -> Result<()> {
     socket.write_all(&encrypted_extensions_record).await?;
     println!("SENT: EncryptedExtensions: {:02x?}", encrypted_extensions_record);
 
+    // トランスクリプトハッシュの更新（EncryptedExtensionsを追加）
+    let mut handshake_messages = handshake_messages_till_sh.clone();
+    handshake_messages.extend_from_slice(&encrypted_extensions_bytes);
+
     // Certificate
-    let certificate = key_schedule.create_certificate()?;
+    let (certificate, plain_certificate) = key_schedule.create_certificate()?;
     socket.write_all(&certificate).await?;
     println!("SENT: Certificate: {:02x?}", certificate);
 
+    // トランスクリプトハッシュの更新（Certificateを追加）
+    handshake_messages.extend_from_slice(&plain_certificate);
+    transcript_hash = digest::digest(digest_alg, &handshake_messages);
+    
     // CertificateVerify
-    let certificate_verify = key_schedule.create_certificate_verify(transcript_hash.as_ref())?;
+    println!("Handshake messages for CertificateVerify: {:02x?}", handshake_messages);
+    println!("Handshake messages length: {}", handshake_messages.len());
+    println!("Transcript hash: {:02x?}", transcript_hash);
+    let (certificate_verify, plain_certificate_verify) = key_schedule.create_certificate_verify(transcript_hash.as_ref())?;
     socket.write_all(&certificate_verify).await?;
     println!("SENT: CertificateVerify: {:02x?}", certificate_verify);
-
+    
+    // トランスクリプトハッシュの更新（CertificateVerifyを追加）
+    handshake_messages.extend_from_slice(&plain_certificate_verify);
+    transcript_hash = digest::digest(digest_alg, &handshake_messages);
+    println!("Updated transcript hash for Finished: {:02x?}", transcript_hash);
+    
     // Finished
     let finished = key_schedule.create_finished(transcript_hash.as_ref());
     let encrypted_finished = key_schedule.encrypt_handshake(&finished, 0x14)?;

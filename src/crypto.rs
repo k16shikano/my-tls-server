@@ -489,7 +489,7 @@ impl KeySchedule {
         Ok((encrypted_message, plain_message))
     }
 
-    pub fn create_certificate_verify(&mut self, transcript_hash: &[u8]) -> Result<Vec<u8>> {
+    pub fn create_certificate_verify(&mut self, transcript_hash: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         // 平文のCertificateVerifyメッセージを作成
         let mut message = Vec::new();
         message.push(0x0f); // HandshakeType::CertificateVerify
@@ -523,7 +523,7 @@ impl KeySchedule {
         // 暗号化
         let encrypted_message = self.encrypt_handshake(&message, 0x0f)?;
 
-        Ok(encrypted_message)
+        Ok((encrypted_message, message))
     }
 
     pub fn sign_certificate_verify(&self, transcript_hash: &[u8]) -> Result<Vec<u8>> {
